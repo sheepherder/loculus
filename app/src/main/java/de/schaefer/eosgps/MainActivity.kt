@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,28 +19,22 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -49,8 +44,6 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 
 class MainActivity : ComponentActivity() {
-    private var teardown: (() -> Unit)? = null
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -58,116 +51,91 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     Scaffold { padding ->
                         Column(modifier = Modifier.padding(padding)) {
-                            AppScreen(registerTeardown = { teardown = it })
+                            AppScreen()
                         }
                     }
                 }
             }
         }
     }
-
-    override fun onStop() {
-        teardown?.invoke()
-        super.onStop()
-    }
 }
 
 @SuppressLint("MissingPermission")
 @Composable
-fun AppScreen(registerTeardown: (() -> Unit) -> Unit) {
+fun AppScreen() {
     val ctx = LocalContext.current
-    val log = remember { mutableStateListOf<String>() }
-    var connState by remember { mutableStateOf(ConnState.IDLE) }
-    var gpsState by remember { mutableStateOf(CanonGpsState.UNKNOWN) }
     var permsGranted by remember { mutableStateOf(hasAllPerms(ctx)) }
-    var bondedDevices by remember { mutableStateOf<List<BluetoothDevice>>(emptyList()) }
-    val client = remember {
-        CanonGattClient(
-            context = ctx.applicationContext,
-            onLog = { line -> log.add(0, line) },
-            onStateChange = { connState = it },
-            onGpsState = { gpsState = it },
-        )
-    }
+    var bondedCanon by remember { mutableStateOf<BluetoothDevice?>(null) }
 
-    DisposableEffect(client) {
-        registerTeardown { client.stopAndDisconnect() }
-        onDispose { client.stopAndDisconnect() }
-    }
+    val serviceRunning by TrackingState.serviceRunning.collectAsState()
+    val connState by TrackingState.connState.collectAsState()
+    val gpsState by TrackingState.gpsState.collectAsState()
+    val fixCount by TrackingState.fixCount.collectAsState()
+    val lastFix by TrackingState.lastFixText.collectAsState()
+    val log by TrackingState.lastLog.collectAsState()
 
     val permLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         permsGranted = results.values.all { it }
-        if (permsGranted) bondedDevices = loadBonded(ctx)
+        if (permsGranted) bondedCanon = findBondedCanon(ctx)
     }
 
     LaunchedEffect(permsGranted) {
-        if (permsGranted) bondedDevices = loadBonded(ctx)
+        if (permsGranted) bondedCanon = findBondedCanon(ctx)
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
         Text("EOS GPS", style = MaterialTheme.typography.headlineSmall)
-        Text("conn: $connState", color = connStateColor(connState), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-        Text("gps:  $gpsState", color = gpsStateColor(gpsState), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+        Text(
+            "target: ${bondedCanon?.name ?: "no bonded EOS found"}",
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        )
+        Text(
+            "conn: $connState",
+            color = connStateColor(connState),
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        )
+        Text(
+            "gps:  $gpsState",
+            color = gpsStateColor(gpsState),
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        )
+        Text(
+            "fixes sent: $fixCount   last: ${lastFix ?: "—"}",
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+        )
 
         if (!permsGranted) {
             Button(onClick = {
-                permLauncher.launch(
-                    arrayOf(
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                        Manifest.permission.BLUETOOTH_SCAN,
-                        Manifest.permission.ACCESS_FINE_LOCATION,
-                    )
-                )
+                permLauncher.launch(allPerms())
             }) { Text("Grant permissions") }
         }
-
-        val canReqGps = connState == ConnState.READY
-        val canSend = gpsState == CanonGpsState.READY_TO_RECEIVE
-        val canStop = connState != ConnState.IDLE && connState != ConnState.DISCONNECTING
 
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.padding(top = 12.dp).fillMaxWidth(),
         ) {
-            Button(onClick = { client.requestGps() }, enabled = canReqGps) { Text("Req GPS") }
-            Button(onClick = {
-                // Berlin Brandenburger Tor for test
-                client.sendGps(52.516275, 13.377704, 34.0, System.currentTimeMillis() / 1000)
-            }, enabled = canSend) { Text("Send Berlin") }
-            Button(onClick = { client.stopAndDisconnect() }, enabled = canStop) { Text("Stop + Disc") }
-        }
-
-        HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
-
-        Text("Bonded devices:", style = MaterialTheme.typography.labelLarge)
-        LazyColumn(modifier = Modifier.heightIn(max = 140.dp).fillMaxWidth()) {
-            items(bondedDevices) { d ->
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("${d.name ?: "?"}  ${d.address}", modifier = Modifier.weight(1f), fontSize = 12.sp)
-                    OutlinedButton(
-                        onClick = { client.connect(d) },
-                        enabled = connState == ConnState.IDLE,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                    ) { Text("Connect", fontSize = 11.sp) }
-                }
-            }
+            Button(
+                onClick = { GpsTrackingService.start(ctx) },
+                enabled = permsGranted && bondedCanon != null && !serviceRunning,
+            ) { Text("Start Tracking") }
+            Button(
+                onClick = { GpsTrackingService.stop(ctx) },
+                enabled = serviceRunning,
+            ) { Text("Stop Tracking") }
         }
 
         HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp))
 
         Text("Log:", style = MaterialTheme.typography.labelLarge)
         Box(
-            modifier = Modifier.fillMaxWidth().weight(1f).background(Color(0xFFF2F2F2)).padding(6.dp),
+            modifier = Modifier.fillMaxWidth().weight(1f)
+                .background(Color(0xFFF2F2F2)).padding(6.dp),
         ) {
             val scroll = rememberScrollState()
             Column(modifier = Modifier.verticalScroll(scroll)) {
-                log.take(300).forEach { line ->
+                log.forEach { line ->
                     Text(line, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
                 }
             }
@@ -188,22 +156,25 @@ private fun gpsStateColor(s: CanonGpsState): Color = when (s) {
 }
 
 @SuppressLint("MissingPermission")
-private fun loadBonded(ctx: Context): List<BluetoothDevice> {
+private fun findBondedCanon(ctx: Context): BluetoothDevice? {
     if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT)
-        != PackageManager.PERMISSION_GRANTED) return emptyList()
+        != PackageManager.PERMISSION_GRANTED) return null
     val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    val adapter: BluetoothAdapter = mgr.adapter ?: return emptyList()
-    return adapter.bondedDevices
-        .sortedByDescending { (it.name ?: "").contains("EOS", ignoreCase = true) }
+    val adapter: BluetoothAdapter = mgr.adapter ?: return null
+    return adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }
 }
 
-private fun hasAllPerms(ctx: Context): Boolean {
-    val needed = listOf(
+private fun allPerms(): Array<String> {
+    val base = mutableListOf(
         Manifest.permission.BLUETOOTH_CONNECT,
         Manifest.permission.BLUETOOTH_SCAN,
         Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION,
     )
-    return needed.all {
-        ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
-    }
+    if (Build.VERSION.SDK_INT >= 33) base += Manifest.permission.POST_NOTIFICATIONS
+    return base.toTypedArray()
+}
+
+private fun hasAllPerms(ctx: Context): Boolean = allPerms().all {
+    ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
 }
