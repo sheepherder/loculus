@@ -71,66 +71,57 @@ Alle Canon-spezifischen Services/Characteristics folgen dem Muster:
 
 Auf Characteristic `00040002` können folgende Kommandos gesendet werden:
 
-| Byte(s) | Bedeutung |
-|---------|-----------|
-| `0x01` | GPS deaktivieren |
-| `0x02` | GPS von Smartphone anfordern |
-| `0x03` | GPS stoppen |
-| **`0x04 <NMEA-bytes>`** | **NMEA-Daten senden (Prefix + ASCII-Payload)** |
-| `0x05` | Aktuelle GPS-Einstellung abfragen |
-| `0x06 0x00` | GPS-Quelle: Deaktiviert |
-| `0x06 0x01` | GPS-Quelle: Externer GPS-Empfänger |
-| `0x06 0x04` | GPS-Quelle: Smartphone |
+| Byte(s) | Write-Type | Bedeutung | Quelle im Dekompilat |
+|---------|-----------|-----------|----------------------|
+| `0x01` | DEFAULT | GPS deaktivieren | `C0275o.I()` mit i5=1 |
+| `0x02` | DEFAULT | GPS von Smartphone anfordern | `C0275o.I()` mit i5=2 |
+| `0x03` | DEFAULT | GPS stoppen | `C0275o.I()` mit i5=3 |
+| `0x04 <19 Byte binary>` | **NO_RESPONSE** | GPS-Fix senden (20 Byte binary format, siehe unten) | `d4.C0500A.G(Location)` |
+| `0x05` | DEFAULT | Aktuelle GPS-Quelle abfragen (Response via NOTIFY) | `C0298u.a()` auto-probe |
+| `0x06 0xNN 0x00*6` (8 Byte!) | DEFAULT | GPS-Quelle setzen: `0x00`=disable, `0x01`=externer Empfänger, `0x04`=Smartphone | `Z3/j.java:181-187` |
 
-**Wichtig:** Das Prefix-Byte `0x04` ist nicht optional. NMEA-Daten ohne Prefix werden mit `GATT_REQUEST_NOT_SUPPORTED` (status=6) abgelehnt und die Kamera trennt die Verbindung. Quelle: dekompilierte Canon-App `com/canon/eos/T.java:183-188`.
+**Write-Type-Regeln:**
+- Kommandos (`0x01`, `0x02`, `0x03`, `0x05`, `0x06 0xNN...`) → `WRITE_TYPE_DEFAULT` (mit Response)
+- GPS-Fix (`0x04 + 19 Byte`) → `WRITE_TYPE_NO_RESPONSE` (keine Bestätigung)
+
+**Wichtig zum Source-Set-Kommando:** Canon allociert `ByteBuffer.allocate(8)` und schreibt nur die ersten 2 Bytes — der Rest bleibt 0. Effektiv werden also **8 Byte** gesendet: `[0x06, src, 0, 0, 0, 0, 0, 0]`. Ob die Kamera mit nur 2 Byte glücklich ist, wurde nicht getestet — besser Canons Format spiegeln.
 
 ### GPS-Datenformat
 
-Die GPS-Daten werden als **Standard NMEA-0183 Sentences** übertragen:
+**Nicht NMEA.** Canon überträgt GPS-Fixes als **kompaktes 20-Byte-Binärframe**, das in eine einzige BLE-PDU der Standard-MTU (23 Byte) passt. Keine MTU-Verhandlung nötig.
 
 ```
-$GPGGA,HHMMSS.000,DDMM.MMMMM,N,DDDMM.MMMMM,E,1,6,0,ALT,M,0,M,,*XX\r\n
-$GPRMC,HHMMSS.000,A,DDMM.MMMMM,N,DDDMM.MMMMM,E,SPEED,BEARING,DDMMYY,0,A*XX\r\n
+Offset  Size   Inhalt
+------  ----   ----------------------------------------------
+0       1      Kommando-Byte 0x04
+1       1      N/S-Indicator ('N'=0x4E oder 'S'=0x53)
+2       4      abs(latitude)  als IEEE 754 float32 big-endian
+6       1      E/W-Indicator ('E'=0x45 oder 'W'=0x57)
+7       4      abs(longitude) als float32 big-endian
+11      1      alt-Sign ('+'=0x2B, '-'=0x2D, oder 0x00 wenn NaN)
+12      4      abs(altitude)  als float32 big-endian (0.0 wenn NaN)
+16      4      Unix-Timestamp in Sekunden als int32 big-endian
+------
+20 Byte total
 ```
 
-#### GPGGA Format (Position Fix)
-```
-$GPGGA,<time>,<lat>,<N/S>,<lon>,<E/W>,<quality>,<sats>,<hdop>,<alt>,M,<geoid>,M,,*<checksum>
-```
+Dieses Frame wird mit **WRITE_TYPE_NO_RESPONSE** auf die Data-Characteristic (`00040002`) geschrieben. Die Kamera schickt **keine Bestätigung** — fire and forget.
 
-- `time`: UTC Zeit als HHMMSS.000
-- `lat`: Breitengrad als DDMM.MMMMM (Grad + Minuten)
-- `lon`: Längengrad als DDDMM.MMMMM (Grad + Minuten)
-- `quality`: 1 = GPS Fix
-- `sats`: Anzahl Satelliten (z.B. 6)
-- `alt`: Höhe in Metern
-- `checksum`: XOR aller Bytes zwischen $ und *
-
-#### GPRMC Format (Recommended Minimum)
-```
-$GPRMC,<time>,A,<lat>,<N/S>,<lon>,<E/W>,<speed>,<bearing>,<date>,<var>,A*<checksum>
-```
-
-- `A`: Status Valid
-- `speed`: Geschwindigkeit in Knoten
-- `bearing`: Kurs in Grad
-- `date`: Datum als DDMMYY
-
-#### Checksum-Berechnung
-```python
-def calculate_nmea_checksum(sentence: str) -> str:
-    checksum = 0
-    for char in sentence:
-        checksum ^= ord(char)
-    return f"{checksum:02X}"
-```
+Quelle: dekompilierte Canon-App `d4.C0500A.G(Location)` (Methode musste mit `jadx --show-bad-code` re-dekompiliert werden, weil der Standard-Decompile den Methoden-Body übersprungen hat).
 
 #### Beispiel
-Für Berlin Brandenburger Tor (52.516275°N, 13.377704°E, 34m):
+Für Berlin Brandenburger Tor (52.516275°N, 13.377704°E, 34m, t=1712926800):
 ```
-$GPGGA,094837.000,5230.97650,N,01322.66224,E,1,6,0,34.0,M,0,M,,*63
-$GPRMC,094837.000,A,5230.97650,N,01322.66224,E,0.0,0.0,310126,0,A*7E
+04 4E 42 52 21 3A 45 41 55 30 7E 2B 42 08 00 00 66 18 C3 50
+│  │  └─────┬──────┘ │  └─────┬──────┘ │  └─────┬──────┘ └─────┬──────┘
+│  │       lat       │      lon        │      alt        unix time
+│  N                 E                  +
+Cmd
 ```
+
+Encoder-Code: siehe `android/app/src/main/java/de/schaefer/eosgps/CanonGpsFrame.kt`.
+
+**Warum das wichtig ist:** Unsere frühen Versuche mit NMEA-Text-Frames (~140 Byte pro Update) haben die Kamera-Firmware mehrfach gecrashed — die Bytes nach dem `0x04`-Kommando wurden vom Parser als binärer Payload interpretiert, und die falschen Werte brachten die GPS-State-Machine in einen Zustand, aus dem sie nicht mehr rauskam (Busy-Lock, Reboot). Siehe `ENTWICKLUNGSVERLAUF.md` für die Story.
 
 ### Pairing-Protokoll
 
@@ -205,12 +196,14 @@ pip install bleak
 Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon.
 
 **Status (2026-04-12):**
-- GATT Connect: ✅
+- GATT Connect auf gebondete Canon: ✅
 - Service-Discovery (Canon GPS Service `0004`): ✅
-- MTU-Negotiation (auf 512 Byte): ✅
-- GPS-Quelle Smartphone setzen (`0x06 0x04`): ✅
-- NMEA-Write mit Prefix `0x04`: ✅
-- Kamera-Anzeige: GPS-Icon **hell** nach erstem NMEA-Paket = valider Fix erkannt ✅
+- Initial-State via READ 00040001 + READ 00040003: ✅
+- CCCD-Subscribe auf 00040003 (NOTIFY): ✅
+- GPS-Frame-Write (20 Byte binary, WRITE_NO_RESPONSE): ✅
+- Kamera-Anzeige: GPS-Icon **hell** nach jedem Frame = valider Fix ✅
+- Mehrfache Sends ohne Firmware-Crash: ✅
+- Graceful Reconnect nach Disconnect: ✅
 
 **Build/Install:**
 ```bash
@@ -222,10 +215,12 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 **Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
 
 **Offen:**
-- [ ] Loop-Test (Stabilität bei kontinuierlichen NMEA-Updates)
-- [ ] FusedLocationProvider statt hardcoded Koordinaten
+- [ ] FusedLocationProvider statt hardcoded Berlin-Koordinaten
+- [ ] Auto-Loop (alle ~5s ein Frame, damit GPS dauerhaft hell bleibt)
 - [ ] Foreground Service für Background-Betrieb
 - [ ] Auto-Reconnect wenn Kamera an/aus geht
+- [ ] `{2}`-Path testen gegen eine frisch zurückgesetzte Kamera (bisher war READY_TO_RECEIVE schon aus vorheriger Canon-App-Session gesetzt)
+- [ ] Stop-Logik fixen: `{3}` auch schicken wenn `gpsState == READY_TO_RECEIVE` (nicht nur wenn `state == GPS_SESSION_ACTIVE`)
 
 ---
 
