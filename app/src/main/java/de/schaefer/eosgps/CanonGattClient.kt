@@ -137,14 +137,20 @@ class CanonGattClient(
         return true
     }
 
-    /** Graceful teardown: 0x03 = stop GPS, then disconnect. */
+    /**
+     * Graceful teardown. Always send 0x03 (stop GPS) when the camera is in a
+     * ready-to-receive state — otherwise the camera is left expecting more
+     * fixes and can end up in a bad state on the next reconnect, leading to a
+     * firmware hang ("Busy" lock requiring battery pull).
+     */
     fun stopAndDisconnect() {
         val g = gatt
         if (g == null) { state = ConnState.IDLE; return }
         val ch = dataChar
-        if (ch != null && (state == ConnState.GPS_SESSION_ACTIVE || state == ConnState.REQUESTING_GPS)) {
+        val needsStop = ch != null && gpsState == CanonGpsState.READY_TO_RECEIVE
+        if (needsStop) {
             state = ConnState.STOPPING
-            enqueue(GattOp.Write(ch, byteArrayOf(0x03), "stop GPS",
+            enqueue(GattOp.Write(ch!!, byteArrayOf(0x03), "stop GPS",
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
         } else {
             doDisconnect()

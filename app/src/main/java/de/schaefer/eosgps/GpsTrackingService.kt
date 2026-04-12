@@ -31,7 +31,7 @@ import com.google.android.gms.location.Priority
 private const val TAG = "GpsService"
 private const val CHANNEL_ID = "eos-gps-tracking"
 private const val NOTIF_ID = 42
-private const val MIN_SEND_INTERVAL_MS = 1500L  // rate-limit BLE writes
+private const val MIN_SEND_INTERVAL_MS = 10_000L  // rate-limit BLE writes (conservative)
 
 class GpsTrackingService : Service() {
 
@@ -111,8 +111,8 @@ class GpsTrackingService : Service() {
             TrackingState.log("ACCESS_FINE_LOCATION missing; cannot stream fixes")
             return
         }
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L)
-            .setMinUpdateIntervalMillis(1000L)
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000L)
+            .setMinUpdateIntervalMillis(5000L)
             .build()
         fused.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
         TrackingState.log("Location updates requested")
