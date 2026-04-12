@@ -282,7 +282,9 @@ class CanonGattClient(
             }
             val desc = ch.getDescriptor(CanonUuids.CCCD)
             if (desc == null) { log("CCCD missing on $label"); return }
-            enqueue(GattOp.WriteDesc(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, "CCCD $label"))
+            // Canon uses INDICATION (0x0200), not NOTIFICATION (0x0100). Confirmed
+            // via HCI snoop of the Canon Camera Connect app.
+            enqueue(GattOp.WriteDesc(desc, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, "CCCD $label"))
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -290,7 +292,20 @@ class CanonGattClient(
             opCompleted()
             if (state == ConnState.SUBSCRIBING) {
                 synchronized(opQueue) {
-                    if (opQueue.isEmpty() && !opInFlight) state = ConnState.READY
+                    if (opQueue.isEmpty() && !opInFlight) {
+                        // After CCCD subscribe, mirror Canon's flow: query current GPS source
+                        // (8-byte write of {5, 0, 0, 0, 0, 0, 0, 0}) before going READY.
+                        // The camera responds via indication with {5, source_byte}.
+                        val ch = dataChar
+                        if (ch != null) {
+                            log("→ querying GPS source (Canon-style 8B probe)")
+                            enqueue(GattOp.Write(ch,
+                                byteArrayOf(0x05, 0, 0, 0, 0, 0, 0, 0),
+                                "probe src=5",
+                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+                        }
+                        state = ConnState.READY
+                    }
                 }
             }
         }

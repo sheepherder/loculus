@@ -95,15 +95,17 @@ Offset  Size   Inhalt
 ------  ----   ----------------------------------------------
 0       1      Kommando-Byte 0x04
 1       1      N/S-Indicator ('N'=0x4E oder 'S'=0x53)
-2       4      abs(latitude)  als IEEE 754 float32 big-endian
+2       4      abs(latitude)  als IEEE 754 float32 LITTLE-ENDIAN
 6       1      E/W-Indicator ('E'=0x45 oder 'W'=0x57)
-7       4      abs(longitude) als float32 big-endian
+7       4      abs(longitude) als float32 LITTLE-ENDIAN
 11      1      alt-Sign ('+'=0x2B, '-'=0x2D, oder 0x00 wenn NaN)
-12      4      abs(altitude)  als float32 big-endian (0.0 wenn NaN)
-16      4      Unix-Timestamp in Sekunden als int32 big-endian
+12      4      abs(altitude)  als float32 LITTLE-ENDIAN (0.0 wenn NaN)
+16      4      Unix-Timestamp in Sekunden als int32 LITTLE-ENDIAN
 ------
 20 Byte total
 ```
+
+**Byte-Order kritisch**: Canon nutzt LITTLE-ENDIAN. Das Dekompilat verwendet `ByteBuffer.allocate(4).putFloat(...)` ohne explizite Order-Setzung — Java-Default ist Big-Endian, aber Canon konfiguriert die Order irgendwo über einen Pfad den jadx übersprungen hat. Verifiziert via HCI-Snoop-Log: die Bytes auf dem Wire sind LE.
 
 Dieses Frame wird mit **WRITE_TYPE_NO_RESPONSE** auf die Data-Characteristic (`00040002`) geschrieben. Die Kamera schickt **keine Bestätigung** — fire and forget.
 
@@ -199,11 +201,13 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 - GATT Connect auf gebondete Canon: ✅
 - Service-Discovery (Canon GPS Service `0004`): ✅
 - Initial-State via READ 00040001 + READ 00040003: ✅
-- CCCD-Subscribe auf 00040003 (NOTIFY): ✅
-- GPS-Frame-Write (20 Byte binary, WRITE_NO_RESPONSE): ✅
-- Kamera-Anzeige: GPS-Icon **hell** nach jedem Frame = valider Fix ✅
-- Mehrfache Sends ohne Firmware-Crash: ✅
-- Graceful Reconnect nach Disconnect: ✅
+- CCCD-INDICATION-Subscribe auf 00040003 (`0x0200`): ✅
+- Source-Query + Indikations-Response: ✅
+- GPS-Frame-Write (20 Byte binary LE, WRITE_NO_RESPONSE): ✅
+- Foreground Service + FusedLocationProvider Auto-Loop: ✅
+- 60+ Sekunden kontinuierliche Session ohne Firmware-Crash: ✅
+- Graceful Stop mit `{3}` + Disconnect: ✅
+- **EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert**: ✅
 
 **Build/Install:**
 ```bash
@@ -215,12 +219,10 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 **Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
 
 **Offen:**
-- [ ] FusedLocationProvider statt hardcoded Berlin-Koordinaten
-- [ ] Auto-Loop (alle ~5s ein Frame, damit GPS dauerhaft hell bleibt)
-- [ ] Foreground Service für Background-Betrieb
-- [ ] Auto-Reconnect wenn Kamera an/aus geht
+- [ ] Auto-Reconnect wenn Kamera aus/an geht (jetzt: manueller Restart)
 - [ ] `{2}`-Path testen gegen eine frisch zurückgesetzte Kamera (bisher war READY_TO_RECEIVE schon aus vorheriger Canon-App-Session gesetzt)
-- [ ] Stop-Logik fixen: `{3}` auch schicken wenn `gpsState == READY_TO_RECEIVE` (nicht nur wenn `state == GPS_SESSION_ACTIVE`)
+- [ ] Optional: Pairing-Service-Handshake machen damit BT-Icon auf Kamera leuchtet (kosmetisch)
+- [ ] Optional: auch Speed/Bearing aus Location übertragen — Format noch nicht bekannt
 
 ---
 
