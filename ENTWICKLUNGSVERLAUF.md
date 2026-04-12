@@ -193,9 +193,63 @@ Nach dem Umbau auf das Binärformat + WRITE_NO_RESPONSE + korrekter Initialseque
 
 Das war der tatsächliche Durchbruch. Die drei Firmware-Crashes davor waren **keine Firmware-Bugs auf Canon-Seite** — sie waren Konsequenz davon, dass wir undefinierte Byte-Sequenzen auf einen binären Command-Channel gefeuert haben, der dazu nicht gedacht war.
 
+## Phase 5 — Noch zwei versteckte Fallstricke und der echte Abschluss
+
+Die Freude über das funktionierende Single-Frame-Schreiben war verfrüht. Als wir den Foreground Service + FusedLocationProvider gebaut und kontinuierliches Tracking aktiviert haben (alle 5s ein Frame), passierte bei der dritten Session wieder das bekannte Muster:
+
+- Erste Frames gingen durch (status=0)
+- Kamera-GPS-Icon ging **aus statt hell** (anders als im manuellen Einzeltest)
+- Nach einigen Frames wurde die Kamera unresponsive
+- Nach Stop: Firmware-Hang
+
+Diesmal hatten wir mehr Beobachtungen. Der Unterschied zu den funktionierenden Einzel-Tests: beim Service senden wir **echte Handy-Koordinaten** aus der Umgebung des Users statt der hardcodierten Berlin-Daten. Der Byte-Stream ist also anders.
+
+### BLE Sniffing: HCI-Snoop
+
+Statt weiter zu raten, haben wir **den echten Canon-App-Traffic aufgezeichnet** — Android hat einen eingebauten HCI-Snoop-Logger, aktivierbar in den Entwickleroptionen:
+
+1. Settings → System → Developer options → "Enable Bluetooth HCI snoop log" = Enabled (Filtered)
+2. Bluetooth aus/an
+3. Canon Camera Connect öffnen, Session durchführen
+4. `adb bugreport` zieht unter anderem `FS/data/misc/bluetooth/logs/btsnoop_hci.log`
+5. Mit Wireshark/tshark analysieren
+
+Im Log fand sich die echte Canon-Sequenz direkt nach Service-Discovery:
+
+```
+Write 0x0048 = 02 00                                   ← CCCD = 0x0200 (INDICATION!)
+Write 0x0045 = 05 00 00 00 00 00 00 00                 ← 8-Byte Source-Query
+Indication 0x0047 = 05 04                              ← "source = SMARTPHONE"
+Write 0x0045 = 04 4e 6e 27 47 42 45 66 14 1f 41 2b …   ← erstes GPS-Frame
+```
+
+Drei unerwartete Details:
+
+**1. Byte-Order ist LITTLE-ENDIAN, nicht Big-Endian.** Das Dekompilat zeigte ganz offensichtlich `ByteBuffer.allocate(4).putFloat(x)` ohne explizite Order — Java-Default ist Big-Endian. Aber die Bytes auf dem Wire sprechen eine andere Sprache: z.B. `6e 27 47 42` für Breitengrad ~49.79°N macht nur Sinn als `0x4247276E` = LE-float32. Canon muss die Order irgendwo via einen Pfad setzen, den jadx elided hat. Wir hatten bis dahin alles in Big-Endian enkodiert — die Kamera las riesige Unsinns-Gleitkommazahlen (`~1e+28°`), markierte den Fix kurz als "received" (daher GPS kurz hell), verwarf ihn sofort wieder (GPS geht aus), und bei Dauerbeschuss mit Müll kollabierte die State-Machine schließlich.
+
+**2. CCCD-Write ist `0x0200` (Indication) nicht `0x0100` (Notification).** Das `00040003` NOTIFY-Characteristic auf der R6m2 unterstützt nur Indications. Mit `0x0100` bekamen wir nie Notifications zurück — wir wussten nicht mal, dass unsere Reads zwar initialen State geben, aber spätere Änderungen nie propagiert werden. Canon nutzt konsistent `0x0200`.
+
+**3. Source-Query ist 8 Byte.** Nicht `{0x05}` wie wir dachten (und wie der erste Analyse-Agent behauptet hatte), sondern `{0x05, 0, 0, 0, 0, 0, 0, 0}` — Canon allociert `ByteBuffer.allocate(8)` und schreibt nur das erste Byte, lässt den Rest auf Null. Auf dem Wire gehen 8 Byte raus.
+
+### Der tatsächliche Abschluss
+
+Mit allen drei Fixes in der App:
+
+- Continuous-Tracking-Session mit echten FusedLocation-Updates
+- Erste echte **Indikation empfangen**: `NOTIFY 0003 0504` — Kamera bestätigt "source = SMARTPHONE"
+- 8 GPS-Frames über eine Minute hinweg, jeweils alle 10-15 Sekunden
+- GPS-Icon **bleibt** hell
+- Kamera durchgehend responsive
+- Sauberer Stop mit `{3}` + Disconnect
+- Kein Firmware-Hang
+
+Und der Test, der zählt: **Foto auf der Kamera aufgenommen, EXIF-Daten im Bild kontrolliert — Geo-Tag-Format identisch zum Output der offiziellen Canon-App.**
+
+Das war der echte Abschluss. Die MVP-Kette aus Protokoll-Reverse-Engineering, falschen Annahmen, mehreren Firmware-Hangs, und schließlich dem HCI-Sniff ist damit durchlaufen.
+
 ## Stand April 2026
 
-Protokoll vollständig und reproduzierbar validiert auf echter Hardware. Die Android-App schreibt GPS-Frames korrekt an die Kamera ohne Firmware-Probleme.
+Protokoll vollständig und reproduzierbar validiert auf echter Hardware. Die Android-App schreibt GPS-Frames korrekt an die Kamera ohne Firmware-Probleme, EXIF-Output identisch zur Canon-App.
 
 **Beobachtungen aus der Live-Testsession:**
 
@@ -216,10 +270,13 @@ Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die technische
 ## Lessons Learned
 
 - **Dekompilaten nicht blind vertrauen.** Der erste Durchgang durch das Dekompilat hat uns falsche Commands (`{4} + NMEA`) plausibel gemacht, weil der wichtigste Methoden-Body von jadx übersprungen worden war — und niemand hat das "Method dump skipped" als Warnung ernst genommen. `jadx --show-bad-code` sollte **Default** sein bei Reverse Engineering, nicht Fallback.
+- **Sniff den echten Traffic so früh wie möglich.** Der Android HCI-Snoop-Log hätte uns Phasen 3-5 komplett erspart. Sobald ein proprietäres BLE-Protokoll relevant ist, ist ein Wireshark-Capture der realen Gegen-App Pflicht-Grundlagenarbeit — nicht Last Resort.
+- **Dekompilate und Wire-Format können auseinanderlaufen.** Canon setzt `ByteOrder.LITTLE_ENDIAN` über einen Code-Pfad, den jadx komplett elided hat. Im Dekompilat sah `ByteBuffer.putFloat` aus wie Big-Endian (Java-Default). Auf dem Wire ist es LE. Ohne Packet-Capture wäre das nie aufgeflogen.
 - **Feldnamen im Dekompilat sind nicht semantisch.** Wir hielten `f4744G` für den NMEA-Puffer, weil es im Kontext des GPS-Files stand. Tatsächlich war es der App-Name aus einem ganz anderen Flow. Bei obfuskierten Feldnamen hilft nur, *alle* Schreibpositionen des Felds zu checken, nicht nur eine.
+- **Indications vs. Notifications**: ein Detail mit großer Wirkung. CCCD `0x0100` (Notify) und `0x0200` (Indicate) sehen in Android-Code fast identisch aus (`setCharacteristicNotification(ch, true)` funktioniert für beide), aber viele Peripherals unterstützen nur genau eins davon. Bei fehlenden State-Callbacks: prüfen, welchen Modus die Peripherie erwartet.
 - **Ein Command-Write, der "irgendwie akzeptiert" wird, heißt nicht, dass er das Richtige tut.** Die Kamera nahm unser `{4} + NMEA` an und zeigte sogar GPS als fixed — und trotzdem war es Müll, der die Firmware in undefinierte States brachte. "Es funktioniert" ist kein Beweis für Korrektheit bei Reverse Engineering.
 - **WRITE_NO_RESPONSE ist ein eigenes Protokoll-Werkzeug, nicht nur eine Performance-Option.** Für High-Frequency-Payloads (Streaming-Daten, Sensor-Feeds) erwarten Geräte oft genau diesen Write-Typ. Default-Writes mit Response können je nach Firmware ignoriert oder als Fehler interpretiert werden.
 - **MTU-Negotiation ist nicht immer nötig.** Wir hatten sie implementiert, weil NMEA nicht in 23 Byte passte. Das echte Protokoll hätte sie gar nicht gebraucht — 20 Byte passen rein. Wir hätten uns den ganzen MTU-Handshake sparen können.
 - **Bestehende System-Pairing-Beziehungen sind Gold wert.** Die Pixel-Kamera-Bond war schon durch Canons eigene App eingerichtet. Eine neue App konnte den GATT-Connect direkt aufbauen, ohne sich mit Canons proprietärem Pairing-Protokoll beschäftigen zu müssen.
-- **Firmware-Crashes ernst nehmen.** Die R6m2 hat unsere Fehler dreimal mit Hangs und Self-Reset bestraft. Nach dem zweiten Crash war die korrekte Reaktion nicht "anderes Timing probieren" sondern **komplett stoppen und die Grundannahmen prüfen**. Das haben wir erst beim dritten Crash gemacht — hätten wir nach dem ersten.
+- **Firmware-Crashes ernst nehmen.** Die R6m2 hat unsere Fehler mehrfach mit Hangs und Self-Reset bestraft. Nach dem zweiten Crash war die korrekte Reaktion nicht "anderes Timing probieren" sondern **komplett stoppen und die Grundannahmen prüfen**. Das haben wir erst beim fünften Crash konsequent gemacht — hätten wir nach dem ersten.
 - **Hardware-Probleme nicht um jeden Preis umgehen wollen.** Der CSR-Adapter blockierte Phase 1 komplett — der Umstieg auf das Pixel war die schnellere Lösung als ein neuer Adapter plus Neutest, und das Zielgerät ist ohnehin das Handy.
