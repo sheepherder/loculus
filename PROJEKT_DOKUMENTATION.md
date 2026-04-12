@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Reverse Engineering abgeschlossen, Proof-of-Concept Script erstellt, Hardware-Problem mit BLE-Adapter identifiziert.
+**Status:** Reverse Engineering abgeschlossen. Android-PoC-App funktioniert auf Pixel 9a — GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert (GPS-Icon leuchtet hell nach Write).
 
-**Datum:** 2026-01-31
+**Datum:** 2026-04-12
 
 ---
 
@@ -76,10 +76,13 @@ Auf Characteristic `00040002` können folgende Kommandos gesendet werden:
 | `0x01` | GPS deaktivieren |
 | `0x02` | GPS von Smartphone anfordern |
 | `0x03` | GPS stoppen |
+| **`0x04 <NMEA-bytes>`** | **NMEA-Daten senden (Prefix + ASCII-Payload)** |
 | `0x05` | Aktuelle GPS-Einstellung abfragen |
 | `0x06 0x00` | GPS-Quelle: Deaktiviert |
 | `0x06 0x01` | GPS-Quelle: Externer GPS-Empfänger |
 | `0x06 0x04` | GPS-Quelle: Smartphone |
+
+**Wichtig:** Das Prefix-Byte `0x04` ist nicht optional. NMEA-Daten ohne Prefix werden mit `GATT_REQUEST_NOT_SUPPORTED` (status=6) abgelehnt und die Kamera trennt die Verbindung. Quelle: dekompilierte Canon-App `com/canon/eos/T.java:183-188`.
 
 ### GPS-Datenformat
 
@@ -191,9 +194,38 @@ pip install bleak
 **Status:**
 - NMEA-Generierung: ✅ Funktioniert
 - BLE-Scan: ✅ Funktioniert (findet Kamera)
-- BLE-Connect: ❌ Scheitert am CSR-Adapter
+- BLE-Connect: ❌ Scheitert am CSR-Adapter (Linux-Host)
 - Pairing: ❌ Nicht getestet (Adapter-Problem)
 - GPS-Senden: ❌ Nicht getestet (Adapter-Problem)
+
+**Hinweis:** Das Python-Script wird aktuell nicht mehr weiterentwickelt — die Entwicklung läuft über die Android-App (`android/`), die auf dem Pixel 9a das CSR-Problem komplett umgeht und bereits funktioniert.
+
+### Android-App (`android/`)
+
+Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon.
+
+**Status (2026-04-12):**
+- GATT Connect: ✅
+- Service-Discovery (Canon GPS Service `0004`): ✅
+- MTU-Negotiation (auf 512 Byte): ✅
+- GPS-Quelle Smartphone setzen (`0x06 0x04`): ✅
+- NMEA-Write mit Prefix `0x04`: ✅
+- Kamera-Anzeige: GPS-Icon **hell** nach erstem NMEA-Paket = valider Fix erkannt ✅
+
+**Build/Install:**
+```bash
+cd android && ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n de.schaefer.eosgps/.MainActivity
+```
+
+**Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
+
+**Offen:**
+- [ ] Loop-Test (Stabilität bei kontinuierlichen NMEA-Updates)
+- [ ] FusedLocationProvider statt hardcoded Koordinaten
+- [ ] Foreground Service für Background-Betrieb
+- [ ] Auto-Reconnect wenn Kamera an/aus geht
 
 ---
 
@@ -333,4 +365,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-01-31*
+*Letzte Aktualisierung: 2026-04-12*
