@@ -39,9 +39,6 @@ object TrackingState {
     val rssi = MutableStateFlow<Int?>(null)
     val cameraPower = MutableStateFlow(CameraPowerState.UNSEEN)
     val lastAdvertAt = MutableStateFlow<Long?>(null)
-    // True when we currently have an offloaded PendingIntent scan armed with
-    // the OS. Written by CanonScanRegistrar and ScanResultReceiver.
-    val scanRegistered = MutableStateFlow(false)
     // elapsedRealtime() when the GPS session became active, null otherwise
     val sessionStartedAt = MutableStateFlow<Long?>(null)
     val lastFixAt = MutableStateFlow<Long?>(null)  // elapsedRealtime() of last successful write

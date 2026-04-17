@@ -103,7 +103,6 @@ fun AppScreen() {
     val sessionStart by TrackingState.sessionStartedAt.collectAsState()
     val lastFixAt by TrackingState.lastFixAt.collectAsState()
     val writeErrors by TrackingState.writeErrors.collectAsState()
-    val scanRegistered by TrackingState.scanRegistered.collectAsState()
     val log by TrackingState.lastLog.collectAsState()
 
     // Auto-start toggle state. Persisted in Prefs; UI state just mirrors it
@@ -122,7 +121,6 @@ fun AppScreen() {
                 batteryOptIgnored = isBatteryOptIgnored(ctx)
                 backgroundLocationGranted = hasBackgroundLocation(ctx)
                 autoStartEnabled = Prefs.autoStartEnabled(ctx)
-                TrackingState.scanRegistered.value = Prefs.scanRegistered(ctx)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -254,13 +252,8 @@ fun AppScreen() {
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     MonoText(if (autoStartEnabled) "on" else "off", bold = true)
-                    val statusLine = when {
-                        !autoStartEnabled -> "manual start only"
-                        scanRegistered -> "listening in background"
-                        else -> "registration pending"
-                    }
                     Text(
-                        statusLine,
+                        if (autoStartEnabled) "listening in background" else "manual start only",
                         fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -458,15 +451,6 @@ private fun rssiColor(rssi: Int?): Color = when {
     else -> Color(0xFFE57373)
 }
 
-@SuppressLint("MissingPermission")
-private fun findBondedCanon(ctx: Context): BluetoothDevice? {
-    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT)
-        != PackageManager.PERMISSION_GRANTED) return null
-    val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    val adapter: BluetoothAdapter = mgr.adapter ?: return null
-    return adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }
-}
-
 private fun allPerms(): Array<String> {
     val base = mutableListOf(
         Manifest.permission.BLUETOOTH_CONNECT,
@@ -481,10 +465,6 @@ private fun allPerms(): Array<String> {
 private fun hasAllPerms(ctx: Context): Boolean = allPerms().all {
     ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
 }
-
-private fun hasBackgroundLocation(ctx: Context): Boolean =
-    ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED
 
 private fun isBatteryOptIgnored(ctx: Context): Boolean {
     val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager

@@ -7,7 +7,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
@@ -175,7 +174,7 @@ class GpsTrackingService : Service() {
         // is visible. So we add it whenever the user granted background
         // location — then GPS works even with the screen off.
         var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        if (hasBackgroundLocation()) {
+        if (hasBackgroundLocation(this)) {
             types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         }
         if (Build.VERSION.SDK_INT >= 34) {
@@ -187,7 +186,7 @@ class GpsTrackingService : Service() {
         TrackingState.resetSession()
         watchdogAnchorMs = 0L
 
-        val device = findBondedCanon()
+        val device = findBondedCanon(this)
         if (device == null) {
             TrackingState.log("No bonded EOS device found")
             stopSelf()
@@ -288,17 +287,16 @@ class GpsTrackingService : Service() {
 
     /**
      * Hard-stop the internal scan before Android silently downgrades it to
-     * SCAN_MODE_OPPORTUNISTIC at ~30 min. If the OS scan is registered, we
-     * hand off (re-arm for a fresh edge, then exit the service). Otherwise
-     * we exit and leave the user to start again — at least no silent decay.
+     * SCAN_MODE_OPPORTUNISTIC at ~30 min. If auto-start is on, hand off
+     * (re-arm for a fresh edge, then exit the service). Otherwise exit and
+     * leave the user to start again — at least no silent decay.
      */
     private val scanTimeout = Runnable {
         if (!scanning || gatt != null) return@Runnable
         val ctx = applicationContext
-        if (Prefs.scanRegistered(ctx)) {
+        if (Prefs.autoStartEnabled(ctx)) {
             TrackingState.log("internal scan timed out (${INTERNAL_SCAN_MAX_MS / 60000}min) → hand off to OS scan")
-            CanonScanRegistrar.unregister(ctx)
-            CanonScanRegistrar.register(ctx)
+            CanonScanRegistrar.rearm(ctx)
         } else {
             TrackingState.log("internal scan timed out — stopping to avoid silent throttling")
         }
@@ -391,14 +389,13 @@ class GpsTrackingService : Service() {
     private val reconnectGiveup = Runnable {
         if (gatt == null && TrackingState.serviceRunning.value) {
             val ctx = applicationContext
-            if (Prefs.scanRegistered(ctx)) {
+            if (Prefs.autoStartEnabled(ctx)) {
                 TrackingState.log("reconnect grace elapsed → re-arm OS scan, hand off")
-                CanonScanRegistrar.unregister(ctx)
-                CanonScanRegistrar.register(ctx)
+                CanonScanRegistrar.rearm(ctx)
                 stopTracking()
             }
-            // If scanRegistered is false, user is in foreground-only mode —
-            // keep running, the internal scan stays on.
+            // Auto-start off: stay running on the internal scan (will hit
+            // INTERNAL_SCAN_MAX_MS eventually and exit cleanly via scanTimeout).
         }
     }
 
@@ -466,17 +463,6 @@ class GpsTrackingService : Service() {
 
     // --- Helpers ---
 
-    @SuppressLint("MissingPermission")
-    private fun findBondedCanon(): BluetoothDevice? {
-        val mgr = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val adapter: BluetoothAdapter = mgr.adapter ?: return null
-        return adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }
-    }
-
-    private fun hasBackgroundLocation(): Boolean =
-        ContextCompat.checkSelfPermission(this,
-            Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
-            PackageManager.PERMISSION_GRANTED
 
     private fun createNotificationChannel() {
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager

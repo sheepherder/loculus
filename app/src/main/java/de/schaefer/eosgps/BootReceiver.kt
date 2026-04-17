@@ -11,12 +11,6 @@ private const val TAG = "BootReceiver"
  * Re-arms the offloaded system scan after device boot or app update. Does not
  * start a foreground service on its own — we wait until the scan delivers an
  * awake advertisement, at which point [ScanResultReceiver] starts the service.
- *
- * Receives: BOOT_COMPLETED (default), LOCKED_BOOT_COMPLETED (direct-boot,
- * before unlock — harmless no-op since we aren't direct-boot-aware and the
- * scan registration is rebuilt via BOOT_COMPLETED anyway), MY_PACKAGE_REPLACED
- * (so the scan is re-armed after app updates that change the filter or the
- * receiver class signature).
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {

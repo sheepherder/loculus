@@ -1,17 +1,13 @@
 package de.schaefer.eosgps
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.PendingIntent
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.util.Log
-import androidx.core.content.ContextCompat
 
 private const val TAG = "CanonScanReg"
 
@@ -24,31 +20,18 @@ private const val TAG = "CanonScanReg"
  * Asleep advertisements (byte 5 = `0x05`, low 3 bits = `0b101`) are filtered
  * out in hardware and never wake the app.
  *
- * MAC is intentionally NOT part of the hardware filter. The only public
+ * MAC is intentionally not part of the hardware filter. The only public
  * `ScanFilter.setDeviceAddress(String)` variant is picky about implicit
- * address-type guessing (Phase 6 lesson in `GpsTrackingService.kt:217-219`);
- * the 2-argument `setDeviceAddress(String, int)` that would fix it is
- * `@SystemApi` and only available to privileged apps. We tolerate that
- * foreign Canon cameras in range can trigger the receiver — they're rare,
- * broadcasts are cheap, and [ScanResultReceiver] re-verifies MAC in code
- * before doing any real work.
- *
- * The scan callback is a `PendingIntent` aimed at [ScanResultReceiver]; when
- * the BT stack detects a match it broadcasts the scan result, Android spins up
- * our process (if needed) and delivers it to the receiver — no foreground
- * service required to stay alive in between.
+ * address-type guessing; the 2-argument `setDeviceAddress(String, int)` that
+ * would fix it is `@SystemApi` and only available to privileged apps. We
+ * tolerate that foreign Canon cameras in range can trigger the receiver —
+ * they're rare, broadcasts are cheap, and [ScanResultReceiver] re-verifies
+ * MAC in code before doing any real work.
  */
 object CanonScanRegistrar {
 
-    private const val ACTION_MATCH = "de.schaefer.eosgps.SCAN_MATCH"
     private const val PI_REQUEST_CODE = 0xCA0
 
-    /**
-     * Registers a PendingIntent-based scan with the OS for the bonded Canon
-     * camera. Safe to call repeatedly — the OS deduplicates identical
-     * PendingIntents; we explicitly unregister first to cover filter changes.
-     * Returns true if registration succeeded.
-     */
     @SuppressLint("MissingPermission")
     fun register(ctx: Context): Boolean {
         if (!hasBluetoothPermissions(ctx)) {
@@ -56,7 +39,7 @@ object CanonScanRegistrar {
             return false
         }
         val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter: BluetoothAdapter? = mgr?.adapter
+        val adapter = mgr?.adapter
         if (adapter == null || !adapter.isEnabled) {
             Log.w(TAG, "register: bluetooth adapter unavailable or disabled")
             return false
@@ -65,10 +48,7 @@ object CanonScanRegistrar {
             Log.w(TAG, "register: bluetoothLeScanner null")
             return false
         }
-        // We still need a bonded Canon on file — the receiver filters the
-        // MAC and we don't want to arm a scan if the user has no camera
-        // paired yet.
-        val mac = findBondedCanonMac(adapter) ?: run {
+        val target = findBondedCanon(ctx) ?: run {
             Log.w(TAG, "register: no bonded EOS device found")
             return false
         }
@@ -85,17 +65,12 @@ object CanonScanRegistrar {
             .setReportDelay(0L)
             .build()
 
-        // Unregister first to clear any stale registration with different
-        // filters from a previous app version.
-        try { scanner.stopScan(buildPendingIntent(ctx)) } catch (_: Exception) {}
-
         val pi = buildPendingIntent(ctx)
+        try { scanner.stopScan(pi) } catch (_: Exception) {}
         return try {
             val rc = scanner.startScan(listOf(filter), settings, pi)
             if (rc == 0) {
-                Prefs.setScanRegistered(ctx, true)
-                TrackingState.scanRegistered.value = true
-                Log.i(TAG, "register: scan armed (byte5 low3=010; target MAC $mac verified in receiver)")
+                Log.i(TAG, "register: scan armed (byte5 low3=010; target MAC ${target.address} verified in receiver)")
                 true
             } else {
                 Log.w(TAG, "register: startScan returned $rc")
@@ -122,12 +97,20 @@ object CanonScanRegistrar {
                 Log.w(TAG, "unregister: ${e.message}")
             }
         }
-        Prefs.setScanRegistered(ctx, false)
-        TrackingState.scanRegistered.value = false
+    }
+
+    /**
+     * Reset the OS scan-engine's per-filter edge state. After a long-lived
+     * GATT session the engine may still see the camera as "found", never
+     * emitting another FIRST_MATCH. Unregister + register clears that.
+     */
+    fun rearm(ctx: Context): Boolean {
+        unregister(ctx)
+        return register(ctx)
     }
 
     private fun buildPendingIntent(ctx: Context): PendingIntent {
-        val intent = Intent(ctx, ScanResultReceiver::class.java).setAction(ACTION_MATCH)
+        val intent = Intent(ctx, ScanResultReceiver::class.java)
         // FLAG_MUTABLE required on API 31+ because the BT stack fills the
         // intent extras with the ScanResult before delivery.
         return PendingIntent.getBroadcast(
@@ -136,16 +119,5 @@ object CanonScanRegistrar {
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
         )
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun findBondedCanonMac(adapter: BluetoothAdapter): String? =
-        adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }?.address
-
-    private fun hasBluetoothPermissions(ctx: Context): Boolean {
-        val scan = ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_SCAN)
-        val connect = ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT)
-        return scan == PackageManager.PERMISSION_GRANTED &&
-            connect == PackageManager.PERMISSION_GRANTED
     }
 }

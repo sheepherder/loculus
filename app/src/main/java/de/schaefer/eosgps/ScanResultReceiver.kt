@@ -1,7 +1,6 @@
 package de.schaefer.eosgps
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanResult
 import android.content.BroadcastReceiver
@@ -17,11 +16,11 @@ private const val TAG = "ScanResultReceiver"
  * manufacturer-data with byte 5 low-3-bits = `0b010` = awake). Registered
  * via [CanonScanRegistrar.register].
  *
- * A subtle Android quirk: PendingIntent-based offloaded scans deliver
- * ScanResults with a trimmed-down [ScanResult.getScanRecord] — often null.
- * So we trust the HW filter for the awake-byte match (the broadcast only
- * fires when the chip confirmed it) and only filter MAC here, because
- * [ScanResult.getDevice] always carries the address.
+ * PendingIntent-based offloaded scans deliver ScanResults with a trimmed-down
+ * [ScanResult.getScanRecord] — often null. We trust the HW filter for the
+ * awake-byte match (the broadcast only fires when the chip confirmed it)
+ * and only filter MAC here, because [ScanResult.getDevice] always carries
+ * the address.
  */
 class ScanResultReceiver : BroadcastReceiver() {
 
@@ -29,13 +28,7 @@ class ScanResultReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         val errCode = intent.getIntExtra(BluetoothLeScanner.EXTRA_ERROR_CODE, -1)
         if (errCode != -1) {
-            // Scan failed at the OS layer. Common causes: BT toggled off, app
-            // moved into a restricted standby bucket. We log and move on; we
-            // will try to re-register next time the user opens the app or the
-            // phone reboots.
-            Log.w(TAG, "scan error $errCode; clearing registration")
-            Prefs.setScanRegistered(ctx, false)
-            TrackingState.scanRegistered.value = false
+            Log.w(TAG, "scan error $errCode")
             return
         }
 
@@ -48,7 +41,7 @@ class ScanResultReceiver : BroadcastReceiver() {
             intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
         } ?: emptyList()
 
-        val bondedMac = bondedCanonMac(ctx) ?: return
+        val bondedMac = findBondedCanon(ctx)?.address ?: return
 
         val match = results.firstOrNull { r ->
             r.device?.address?.equals(bondedMac, ignoreCase = true) == true
@@ -59,17 +52,5 @@ class ScanResultReceiver : BroadcastReceiver() {
 
         Log.i(TAG, "awake ad from $bondedMac rssi=${match.rssi} → waking service")
         GpsTrackingService.startForAwakeAd(ctx)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun bondedCanonMac(ctx: Context): String? {
-        val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter = mgr?.adapter ?: return null
-        return try {
-            adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }?.address
-        } catch (e: SecurityException) {
-            Log.w(TAG, "bondedCanonMac: ${e.message}")
-            null
-        }
     }
 }
