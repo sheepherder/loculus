@@ -11,15 +11,24 @@ data class CameraInfo(
 )
 
 /**
- * Power state derived from Canon BLE advertisement manufacturer data (last
- * byte of the 6-byte Canon-specific payload under company ID 0x01A9):
- *   0x02 → AWAKE   — camera is fully on, safe to connect + fire kickoff
- *   0x05 → ASLEEP  — camera in BLE standby; connecting & writing would wake it
- *   anything else → UNKNOWN, treat conservatively as asleep
- * When no advertisement has been observed (recently) we report UNSEEN — the
- * camera may be out of range, battery-less, or fully off.
+ * Power state decoded from bits 1–2 of byte 5 of the Canon BLE advertisement
+ * (manufacturer-specific data, company id 0x01A9). The three non-UNSEEN
+ * values are Canon's own enum names (EnumC0259k in the decompiled app);
+ * connecting is only safe in POWER_ON.
+ *   POWER_ON        — camera fully on, connect + GATT work without waking it
+ *   AUTO_POWER_OFF  — camera auto-idled after inactivity, mechanics parked
+ *                     loosely; connecting would wake it audibly
+ *   POWER_SW_OFF    — main switch off, shutter closed, lens parked
+ *   UNSEEN          — no recent advertisement (out of range / battery out)
  */
-enum class CameraPowerState { UNSEEN, ASLEEP, AWAKE }
+enum class CameraPowerState { UNSEEN, POWER_ON, AUTO_POWER_OFF, POWER_SW_OFF }
+
+fun CameraPowerState.label(): String = when (this) {
+    CameraPowerState.POWER_ON -> "on"
+    CameraPowerState.AUTO_POWER_OFF -> "auto-off"
+    CameraPowerState.POWER_SW_OFF -> "sw-off"
+    CameraPowerState.UNSEEN -> "unseen"
+}
 
 /**
  * Shared observable state between the tracking service and the UI.

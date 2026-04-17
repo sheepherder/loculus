@@ -199,7 +199,7 @@ class GpsTrackingService : Service() {
 
         if (awakeHint) {
             TrackingState.log("started by awake-ad → connecting directly")
-            TrackingState.cameraPower.value = CameraPowerState.AWAKE
+            TrackingState.cameraPower.value = CameraPowerState.POWER_ON
             markAdvertisement()
             startGattSession()
         } else {
@@ -303,15 +303,13 @@ class GpsTrackingService : Service() {
         val mfg = result.scanRecord?.getManufacturerSpecificData(CanonAd.COMPANY_ID) ?: return
         if (mfg.size <= CanonAd.POWER_BYTE_INDEX) return
         markAdvertisement()
-        val newState = CanonAd.powerStateFromByte(mfg[CanonAd.POWER_BYTE_INDEX])
+        val newState = CanonAd.powerStateFromByte(mfg[CanonAd.POWER_BYTE_INDEX]) ?: return
         val prev = TrackingState.cameraPower.value
         if (prev != newState) {
             TrackingState.cameraPower.value = newState
-            TrackingState.log("adv: ${prev.name.lowercase()} → ${newState.name.lowercase()} (${mfg.toHex()})")
+            TrackingState.log("adv: ${prev.label()} → ${newState.label()}")
         }
-        if (newState == CameraPowerState.AWAKE && gatt == null) {
-            // Camera just became reachable in awake state. Stop scanning and
-            // establish GATT + fire Canon kickoff.
+        if (newState == CameraPowerState.POWER_ON && gatt == null) {
             stopScan()
             startGattSession()
         }
@@ -494,7 +492,7 @@ class GpsTrackingService : Service() {
         val conn = TrackingState.connState.value
         val fixes = TrackingState.fixCount.value
         val last = TrackingState.lastFixText.value ?: "—"
-        val text = "${power.name.lowercase()} · $conn · $fixes fixes · $last"
+        val text = "${power.label()} · $conn · $fixes fixes · $last"
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         mgr.notify(NOTIF_ID, buildNotification(text))
     }
@@ -526,4 +524,3 @@ class GpsTrackingService : Service() {
     }
 }
 
-private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

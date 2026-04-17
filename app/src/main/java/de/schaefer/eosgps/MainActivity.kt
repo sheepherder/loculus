@@ -173,9 +173,16 @@ fun AppScreen() {
 
         InfoCard("Connection") {
             KeyValueRow("power") {
+                // Distinguish "scanner running but no ad heard" (unseen)
+                // from "not scanning at all" (—). Without this, the power
+                // row looks identical in both cases.
+                val scanning = serviceRunning || autoStartEnabled
+                val powerLabel =
+                    if (cameraPower == CameraPowerState.UNSEEN && !scanning) "—"
+                    else cameraPower.label()
                 StatusDot(color = powerStateColor(cameraPower))
                 Spacer(Modifier.width(6.dp))
-                MonoText(cameraPower.name.lowercase())
+                MonoText(powerLabel)
                 // Camera stops advertising during a GATT session; hide the
                 // age then so it doesn't grow meaninglessly.
                 if (lastAdvertAt != null && connState == ConnState.IDLE) {
@@ -439,9 +446,10 @@ private fun gpsStateColor(s: CanonGpsState): Color = when (s) {
 }
 
 private fun powerStateColor(s: CameraPowerState): Color = when (s) {
-    CameraPowerState.AWAKE -> Color(0xFF4CAF50)
-    CameraPowerState.ASLEEP -> Color(0xFFFFB74D)
-    CameraPowerState.UNSEEN -> Color(0xFF757575)
+    CameraPowerState.POWER_ON -> Color(0xFF4CAF50)         // green
+    CameraPowerState.AUTO_POWER_OFF -> Color(0xFFFFB74D)   // orange
+    CameraPowerState.POWER_SW_OFF -> Color(0xFF9E9E9E)     // grey (deliberate off)
+    CameraPowerState.UNSEEN -> Color(0xFF757575)           // dim grey (no contact)
 }
 
 private fun rssiColor(rssi: Int?): Color = when {
