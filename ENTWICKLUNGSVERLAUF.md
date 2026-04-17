@@ -353,11 +353,61 @@ App macht in Alltag-Szenarien das was sie soll:
 
 Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die aktualisierte technische Referenz.
 
+## Nachbetrachtung — was wir rückblickend hätten wissen können
+
+Nach Abschluss von Phase 6 haben wir die Literaturrecherche gemacht die wir vor Projektstart hätten machen sollen. Ergebnisse, geordnet nach Überlappung mit unserem Projekt:
+
+### Prior art im Community-Umfeld
+
+**[`gkoh/furble` Issue #189 — Support Canon EOS GPS](https://github.com/gkoh/furble/issues/189)** (eröffnet Mai 2025, gemerged November 2025 via PR #199): das einzige öffentliche Repo das Canon-GPS-über-BLE tatsächlich dokumentiert. `@Jerroder` (EOS R6) und `@gkoh` haben via HCI-Snoops herausgefunden:
+
+- **20-Byte-Binärframe exakt identisch zu unserem**: `0x04 + N/S + lat-float32-LE + E/W + lon + alt-sign + alt + uint32-epoch`
+- **INDICATE-CCCDs statt NOTIFY** auf GPS- und Pairing-Service
+- **Write `0x01` auf `0001000a`** (sie nennen's `CHR_IDEN_UUID`) als „Paired!"-Confirmation — das ist *exakt* unser Pairing-Kickoff-Write
+- Die R6m2-spezifische **Constraint**: entweder Focus+Shutter ODER Shutter+GPS, nie beides gleichzeitig (durch Remote- vs Smart-Pairing-Mode bestimmt)
+
+Das heißt: Phase 5 hätten wir (mit dieser Quelle im Rücken) in einem Bruchteil der Zeit abschließen können. Der 20-Byte-Frame plus LE-Encoding plus INDICATE-CCCD war 2025-06-21 von Jerroder/gkoh gecrackt, sechs Monate bevor wir in Phase 1 begonnen haben.
+
+### Was furble nicht hat und was wir neu beitragen
+
+- **Advertisement-Byte-5-Power-Detection**: furble matcht Canons nur auf Service-UUID. Sie dekodieren für **Sony**-Kameras im selben Repo einen analogen Mode-Byte (`ADV_MODE22_PAIRING_SUPPORTED | ADV_MODE22_PAIRING_ENABLED | ADV_MODE22_REMOTE_ENABLED`), haben das für Canon aber nie gemacht.
+- **Handover-Service `00020000`**: furble kennt den Service nicht, sie pairen „just works" direkt über `00010000`. Unser `{0x0a}`-Write auf `00020002` ist in keiner öffentlichen Quelle dokumentiert. Wir brauchen den Write aber vermutlich nur weil wir eine bestehende Canon-App-Bond erben statt frisch zu pairen.
+- **R6m2-Testing**: furbles Thread hatte genau einen R6m2-Besitzer (`@hijae`), der sich nach erstem Feedback nie wieder gemeldet hat. Nur R6 wurde offiziell validiert. Unsere App ist die erste verifizierte R6m2-BLE-GPS-Implementierung außerhalb Canons eigener App.
+- **Scan-First + Auto-Reconnect-Architektur**: Jedes andere Canon-Remote-Tool (inkl. furble) connectet beim User-Trigger. Wir scannen passiv und connecten nur bei echten Wake-Events.
+
+### Andere Repos zum Canon-BLE-Protokoll (alle rein Remote/Shutter, kein GPS)
+
+Alle matchen nur auf Canon-Service-UUID, nutzen `haveServiceUUID()`-Filter, kein Advertisement-Parsing:
+
+- [`pklaus/canoremote`](https://github.com/pklaus/canoremote) — Python, MAC-per-CLI, kein Scan
+- [`ids1024/cannon-bluetooth-remote`](https://github.com/ids1024/cannon-bluetooth-remote) — Python via `btgatt-client`
+- [`maxmacstn/ESP32-Canon-BLE-Remote`](https://github.com/maxmacstn/ESP32-Canon-BLE-Remote) — ESP32, service-UUID-match
+- [`RReverser/eos-remote-web`](https://github.com/RReverser/eos-remote-web) — Web Bluetooth API
+- [`iebyt/cbremote`](https://github.com/iebyt/cbremote) — Android, auch nur Service-Match
+
+### Ian Douglas Scott (2017/2018)
+
+[Die zwei Blog-Posts](https://iandouglasscott.com/2018/07/04/canon-dslr-bluetooth-remote-protocol/) dokumentieren das GATT-Pairing-Protokoll auf T7i (ältere Canon). Grundlage für `canoremote`-etc. Nichts zu GPS, nichts zu Advertisements, nichts zu R6m2-Quirks.
+
+### Fazit
+
+Die „eigentliche GPS-Crack-Leistung" war 2025 bei furble. Unser Eigenanteil liegt in:
+
+1. **Advertisement-Power-Byte als Wake-Signal** (genuine novel für Canon)
+2. **Handover-Service-Kickoff** (unklar ob nötig in furble's fresh-pair-Flow, bei uns essentiell)
+3. **Scan-First-Architektur** auf Android mit Auto-Reconnect
+4. **R6m2-Verifizierung** und Dokumentation der modellspezifischen Constraints
+5. **Android-BT-Stack-Quirks-Katalog** (Churn-Limits, ScanFilter-Picky, etc.)
+
+Wäre ein dankbarer PR an `gkoh/furble` um dort die Canon-Scan-Robustheit mit dem Power-Byte zu ergänzen — die Code-Struktur ist vorhanden (ihre Sony-Implementation zeigt den Weg).
+
 ## Lessons Learned
 
-- **Wake-Detection gehört in die Advertisement-Payload, nicht in die Verbindung.** Die R6m2 broadcastet ihren Power-State (last byte der Murata-Manufacturer-Data unter `0x01A9`) bei jeder Advertising-Pulse. Passiv mit­lesen reicht, kein GATT, kein Wake. Canon macht das genauso — nicht verbinden, sondern scannen.
+- **Wake-Detection gehört in die Advertisement-Payload, nicht in die Verbindung.** Die R6m2 broadcastet ihren Power-State (letztes Byte der Canon-Manufacturer-Data unter Company-ID `0x01A9`) bei jeder Advertising-Pulse. Passiv mit­lesen reicht, kein GATT, kein Wake. Canon macht das genauso — nicht verbinden, sondern scannen.
 - **Connection-Timing ist kein Signal.** BLE-Advertising-Zyklen bringen so viel Varianz rein dass „schneller Connect = wach" keine robuste Aussage ist. Korrelation mit Power-State-Byte war 1:1, Timing war es nie.
-- **Wireshark-Ausgabe ist nicht „die Bytes".** Manufacturer-Specific-Records werden halb-dekodiert dargestellt — ich habe zuerst `01 0b` als Company-ID LE gelesen (= Canon), obwohl die echte ID vor `01 0b` steckte (Murata `0xa9 01`). Was man in `Data:` sieht, sind die **Rest-Bytes nach dem Company-ID**, nicht der Anfang. Im Android-API kommt das auch so an (`getManufacturerSpecificData(companyId)` gibt die Rest-Bytes zurück). Dreimal die Bytes mit Wireshark-Packet-Tree statt mit der Flat-Ausgabe verifizieren.
+- **Wireshark-Ausgabe ist nicht „die Bytes".** Manufacturer-Specific-Records werden halb-dekodiert dargestellt — ich habe zuerst `01 0b` als Company-ID LE gelesen (hab's sogar als „Canon Inc." zuordnen wollen und landete fälschlich bei `0x0B01`), obwohl die echte Company-ID `0x01A9` vorher abgetrennt wurde und die 6 Bytes die Wireshark als „Data" zeigt bereits der Rest **nach** der Company-ID sind. Im Android-API kommt's genauso an (`getManufacturerSpecificData(companyId)` gibt die Rest-Bytes zurück). Dreimal die Bytes mit Wireshark-Packet-Tree statt mit der Flat-Ausgabe verifizieren.
+- **MAC-OID und BLE-Company-ID sind zwei verschiedene Registries.** Canons R6m2 hat eine MAC `34:90:EA:...` deren OID laut IEEE an **Murata Manufacturing** vergeben ist (der Hersteller des BLE-Moduls), während die Advertisement-Company-ID `0x01A9` laut Bluetooth SIG an **Canon Inc.** vergeben ist. Es ist kein Widerspruch — die Hardware kommt von Murata, das Protokoll ist Canons. Scanner-Tools zeigen beides gleichzeitig an; leicht verwechselbar.
+- **Recherche vor Implementation.** `gkoh/furble` Issue #189 hatte das 20-Byte-Frame-Format, die INDICATE-CCCDs und den `01`-Pairing-Write-Trigger schon sechs Monate vor Projektstart entschlüsselt. Ein GitHub-Issue-Search oder grep nach Canon+GPS+BLE am Anfang hätte Phase 5 halbiert. Gelernt: **vor dem Dekompilieren die öffentlichen Issue-Threads und PRs durchsuchen**.
 - **Prüfe ob dein BLE-Sniff wirklich von dem Gerät ist, das du glaubst.** Ich habe eine Withings-ScanWatch-Konversation als Canon-Standby-Service fehlgedeutet. Zu schnell auf UUID-ähnelndes Pattern gesprungen, nicht auf MAC-Filter bestanden. Beim nächsten Mal: Filter auf Peer-MAC **vor** der Analyse, nicht nach.
 - **Initial-Read-Werte sind nicht „jetzt", sondern „zuletzt".** `ByteBuffer`-Werte der GATT-Characteristics sind die letzten Werte die die Kamera gesendet hat — oft aus einer früheren Session. Für Live-State musst du auf `onCharacteristicChanged` warten (Notification/Indication), nicht auf `onCharacteristicRead`. Ausnahme: wenn die Kamera ihren State seit dem letzten Mal nicht gewechselt hat, sendet sie keine frische Indication → dann ist der Read-Wert das Beste was du hast. Bedeutet: wir brauchen **beide** Pfade, mit Vorrang auf die Indication.
 - **Android-BT-Stack hat ein Churn-Limit.** Nach einem Dutzend schneller Connect/Disconnect-Zyklen hört Android auf, Advertisements für eine MAC weiterzureichen. BT-Toggle oder Abwarten hilft, aber verhindern kann man es im App-Code nicht.

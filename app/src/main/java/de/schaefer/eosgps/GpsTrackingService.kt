@@ -45,13 +45,20 @@ private const val RSSI_POLL_INTERVAL_MS = 5_000L
 private const val AD_STALENESS_THRESHOLD_MS = 8_000L
 private const val STALENESS_CHECK_INTERVAL_MS = 2_000L
 
-// Canon BLE advertisement decoding. Company ID 0x01A9 is Murata (the OEM whose
-// module Canon uses). Android's getManufacturerSpecificData returns 6 bytes
-// after the company-id prefix — e.g. "01 0b 33 f3 4b 05" on our R6m2. The
-// first 5 bytes are constant model/variant padding; the last byte (index 5)
-// is the power state, verified by HCI snoops of both camera states:
+// Canon BLE advertisement decoding. Company ID 0x01A9 is Canon Inc. (assigned
+// by the Bluetooth SIG — not Murata, which is 0x013C; Canon uses Murata BLE
+// modules physically but signs its advertisements with its own ID).
+// Android's getManufacturerSpecificData returns 6 bytes after the company-id
+// prefix — e.g. "01 0b 33 f3 4b 05" on our R6m2. Bytes 0-4 are constant on
+// this model (likely protocol version + model-family code; unverified without
+// a second body to compare). Byte 5 is the power state, verified by HCI
+// snoops:
 //   0x02 = camera fully on (safe to connect + kickoff)
 //   0x05 = camera in BLE standby (connecting + writing would wake it)
+// This power-state byte is not decoded by any public Canon-BLE reverse-
+// engineering project (checked Nov 2026: canoremote, cannon-bluetooth-remote,
+// ESP32-Canon-BLE-Remote, eos-remote-web, gkoh/furble). furble decodes a
+// similar byte for Sony cameras but matches Canon only by service UUID.
 private const val CANON_COMPANY_ID = 0x01A9
 private const val STATE_AWAKE: Byte = 0x02
 private const val STATE_ASLEEP: Byte = 0x05

@@ -71,14 +71,17 @@ Alle Canon-spezifischen Services/Characteristics folgen dem Muster:
 
 Die R6m2 advertiset im Standby-Modus mit einer **anderen Advertising-Rate und einem State-Byte** als im aktiven Modus. Beide Signale sind unabhängig voneinander beobachtbar durch reines Scannen — kein Connect, kein ATT-Write, kein Wake-Risiko.
 
-**Manufacturer Specific Data** unter Company-ID `0x01A9` (Bluetooth SIG assigned zu **Murata Manufacturing** — Canon verwendet Murata-Module, daher nicht die eigene Canon-ID `0x0B01`):
+**Manufacturer Specific Data** unter Company-ID `0x01A9` (Bluetooth SIG assigned zu **Canon Inc.** — nicht zu verwechseln mit dem Murata-Eintrag der MAC-OID, siehe unten):
 
 ```
-Byte 0..4   konstant  01 0b 33 f3 4b   (vermutlich Modell/Revision-Kennung)
+Byte 0..4   konstant  01 0b 33 f3 4b   (vermutlich Protokoll-Version + Modellfamilie-Code,
+                                         unverifiziert ohne Vergleich mit anderem Modell)
 Byte 5      variabel  0x02 = AWAKE (Kamera voll eingeschaltet)
                        0x05 = ASLEEP (Kamera in BLE-Standby)
                        anderes → konservativ als ASLEEP behandeln
 ```
+
+**MAC-OID vs. Company-ID**: die R6m2-MAC `34:90:EA:…` liegt im **Murata**-OUI-Bereich (IEEE-Registry — Murata ist der Hersteller des BLE-Moduls), die Advertisement-Company-ID `0x01A9` gehört aber **Canon Inc.** (Bluetooth-SIG-Registry — Canon ist Protokoll-Eigner). Beides gleichzeitig im selben Gerät ist üblich und kein Widerspruch — die zwei Registries addressieren unterschiedliche Schichten.
 
 Zusätzliche Signatur (redundant, aber stabil):
 - Awake: Advertisement-Rate ~200ms (5–6 Ads/s)
@@ -316,23 +319,38 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 ### Dokumentation & Reverse Engineering
 
-- [Ian Douglas Scott - Canon Bluetooth Protocol](https://iandouglasscott.com/2018/07/04/canon-dslr-bluetooth-remote-protocol/)
-  - Reverse Engineering des Canon BLE Remote-Protokolls
-  - Basis für Pairing-Verständnis
+- [Ian Douglas Scott — Canon Bluetooth Protocol (2018)](https://iandouglasscott.com/2018/07/04/canon-dslr-bluetooth-remote-protocol/)
+  - Reverse Engineering des Canon-BLE-Remote-Protokolls auf EOS T7i
+  - Dokumentiert das GATT-Pairing-Protokoll + Shutter-Service Bit-Flags
+  - Basis für canoremote / ESP32-Canon-BLE-Remote / eos-remote-web
+  - Nichts zu GPS, Advertisements oder R6m2-Quirks
 
-- [blackdot.be - GPS Tracking for Photography](https://www.blackdot.be/2025/02/photography-gps-tracking/)
-  - Beschreibt das gleiche Problem
-  - Workarounds mit GPX-Logging
+- [gkoh/furble Issue #189 — Support Canon EOS GPS](https://github.com/gkoh/furble/issues/189)
+  - HCI-Log-basierte Analyse des Canon-EOS-GPS-Protokolls (Jerroder/gkoh, 2025)
+  - 20-Byte-Binärframe, INDICATE-CCCDs, `0x01`-Pairing-Trigger
+  - Deckungsgleich mit unseren Phase-5-Ergebnissen, nur sechs Monate älter
+  - Implementierung in `lib/furble/CanonEOSSmart.cpp` im selben Repo
+
+- [blackdot.be — GPS Tracking for Photography (2025)](https://www.blackdot.be/2025/02/photography-gps-tracking/)
+  - Beschreibt dasselbe Use-Case-Problem aus Fotografen-Sicht
+  - Workarounds mit externem GPX-Logging (nicht BLE)
 
 ### Open Source Projekte
 
-| Projekt | Beschreibung | Link |
-|---------|--------------|------|
-| canoremote | Python BLE Remote für Canon | [pklaus/canoremote](https://github.com/pklaus/canoremote) |
-| cannon-bluetooth-remote | Python BR-E1 Emulator | [ids1024/cannon-bluetooth-remote](https://github.com/ids1024/cannon-bluetooth-remote) |
-| ESP32-Canon-BLE-Remote | ESP32-basierte Lösung | [maxmacstn/ESP32-Canon-BLE-Remote](https://github.com/maxmacstn/ESP32-Canon-BLE-Remote) |
+| Projekt | Sprache | GPS? | Relevanz |
+|---------|---------|------|----------|
+| [gkoh/furble](https://github.com/gkoh/furble) (Issue [#189](https://github.com/gkoh/furble/issues/189), PR #199) | C++/ESP32 | **Ja** | **Wichtigste Referenz für GPS-Protokoll.** Dokumentiert (Mai–Nov 2025) 20-Byte-GPS-Frame, INDICATE-CCCDs, `01`-Pairing-Trigger für Canon-EOS-Familie. Matcht Canons im Scan aber nur auf Service-UUID, kein Advertisement-Power-Byte. Focus/GPS-Constraint per Pairing-Mode dokumentiert. Kein R6m2-spezifisches Testing (nur R6). |
+| [pklaus/canoremote](https://github.com/pklaus/canoremote) | Python | Nein | BLE-Remote (Shutter), MAC-per-CLI, kein Scan |
+| [ids1024/cannon-bluetooth-remote](https://github.com/ids1024/cannon-bluetooth-remote) | Python | Nein | BR-E1-Emulator über `btgatt-client` |
+| [maxmacstn/ESP32-Canon-BLE-Remote](https://github.com/maxmacstn/ESP32-Canon-BLE-Remote) | C++/ESP32 | Nein | Service-UUID-Match, kein Advertisement-Parsing |
+| [RReverser/eos-remote-web](https://github.com/RReverser/eos-remote-web) | JS/WebBluetooth | Nein | Browser-basiert, nutzt Web-BT-`filters` |
+| [iebyt/cbremote](https://github.com/iebyt/cbremote) | Java/Android | Nein | Frühe Android-Canon-Remote-App |
 
-**Hinweis:** Keines dieser Projekte implementiert GPS-Übertragung, nur Remote-Auslösung.
+**Eigenbeitrag gegenüber dem Stand der Technik** (Stand April 2026):
+
+- **Advertisement-basierte Power-Detection** auf Canon (Byte 5 der Mfg-Data unter `0x01A9`) — furble macht das Äquivalent für Sony, aber nicht Canon. Unser Fund erlaubt erstmals passive Scan-First-Architektur ohne Wake-Risiko bei schlafenden Kameras.
+- **Handover-Service-Kickoff** (`0x0a`-Write auf `00020002`) — in keinem öffentlichen Projekt dokumentiert. Vermutlich nur bei App-Seiten nötig die eine bestehende Canon-App-Bond erben statt frisch zu pairen.
+- **R6m2-spezifische Verifikation**: im furble-Thread hat `@Jerroder` auf R6 getestet und `@hijae` hat zu R6m2 nie zurückgemeldet. Wir sind die erste dokumentierte R6m2-BLE-GPS-Implementation außerhalb der offiziellen Canon-App.
 
 ### Tools
 

@@ -11,8 +11,8 @@ data class CameraInfo(
 )
 
 /**
- * Power state derived from Canon BLE advertisement manufacturer data (byte 3 of
- * the 4-byte Canon-specific payload under company ID 0x0B01):
+ * Power state derived from Canon BLE advertisement manufacturer data (last
+ * byte of the 6-byte Canon-specific payload under company ID 0x01A9):
  *   0x02 → AWAKE   — camera is fully on, safe to connect + fire kickoff
  *   0x05 → ASLEEP  — camera in BLE standby; connecting & writing would wake it
  *   anything else → UNKNOWN, treat conservatively as asleep
