@@ -247,28 +247,121 @@ Und der Test, der zählt: **Foto auf der Kamera aufgenommen, EXIF-Daten im Bild 
 
 Das war der echte Abschluss. Die MVP-Kette aus Protokoll-Reverse-Engineering, falschen Annahmen, mehreren Firmware-Hangs, und schließlich dem HCI-Sniff ist damit durchlaufen.
 
-## Stand April 2026
+## Phase 6 — Haupt-Screen, Kickoff, Scan-First (April 2026)
 
-Protokoll vollständig und reproduzierbar validiert auf echter Hardware. Die Android-App schreibt GPS-Frames korrekt an die Kamera ohne Firmware-Probleme, EXIF-Output identisch zur Canon-App.
+Die MVP-Runde aus Phase 5 war protokollmäßig abgeschlossen — GPS fließt, EXIF stimmt. Ziel dieser Phase: die App alltagstauglich machen. Infos auf dem Hauptbildschirm (Modell, Firmware, Seriennummer), Auto-Reconnect, optional Fernauslöser. Dabei sind wir über mehrere hartnäckige Annahmen gestolpert und haben am Ende die gesamte Architektur auf **Scan-First** umgestellt.
 
-**Beobachtungen aus der Live-Testsession:**
+### DIS-Reads scheitern an Canons Pairing
 
-- Der `{2}`-Request-Path wurde nie exerziert: die Kamera war bereits in `READY_TO_RECEIVE` von einer früheren Canon-App-Session. Die `{2}`-Logik ist defensiv im Code für den Fall einer frisch zurückgesetzten Kamera, aber ungetestet.
-- Nach dem Disconnect wird das GPS-Icon **grau-statisch**, nicht blinkend. Das ist auch beim Canon-App-Disconnect so — also normales R6m2-Verhalten, kein Fehler.
-- Wenn die offizielle Canon-App connected, wechselt ein **Bluetooth-Symbol** auf dem Kamera-Display von grau auf hell. Bei uns bleibt das Symbol grau. Vermutlich macht Canon einen Handshake über den Pairing-Service (`0001`) — liest `00010006` (Device Name) und schreibt `{1} + app-name` zu `00010005`. Kosmetischer Status-Indikator, nicht Gate-keeping für GPS.
+Erster Schritt: die App soll beim Connect Modell und Firmware aus dem Standard-Device-Information-Service (`0x180a`) lesen — Canon-App macht das laut Dekompilat auch. In der Praxis kam beim ersten Read prompt `status=133` (`GATT_ERROR`), direkt danach `onConnectionStateChange status=61` (HCI `0x3D` = „Connection Failed to be Established / MAC Connection Failed"). Der Link wurde vom Android-BT-Stack abgerissen.
 
-**Offen:**
+Ursache: die DIS-Characteristics auf der R6m2 sind **verschlüsselungspflichtig**. Canons eigenes proprietäres Pairing (über `00010000`-Service) installiert aber **keine SMP-Keys** im Android-Bond-Store. Unser System-Bond existiert als Record, aber ohne Encryption-Keys. Ein Read auf einen verschlüsselten Char triggert Android's Encryption-Escalation, die scheitert, Link stirbt.
 
-- FusedLocationProvider statt Berlin-Hardcoded
-- Auto-Loop (alle ~5 s ein Frame)
-- Foreground Service für Hintergrundbetrieb
-- Auto-Reconnect wenn Kamera aus/an geht
-- Optional: Canon-App-Handshake nachmachen, damit das BT-Icon leuchtet
+Die Canon-App sieht dagegen „Canon Inc.", „330b", „1.0.0" etc. beim Lesen derselben Chars — vermutlich hat sie einen Auth-Weg den wir nicht nachvollziehen konnten. Mangels Alternative: **DIS-Reads bleiben draußen**. Modell aus BT-Namen ableiten wurde ebenfalls verworfen (User-Instruktion: nicht aus User-editierbaren Feldern raten).
 
-Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die technische Referenz.
+### Echter Kickoff: `0a` + `01`
+
+Beim Versuch, das Canon-BT-Icon auf der Kamera zum Leuchten zu bringen, fiel uns auf dass wir beim Connect einen anderen State bekamen als Canon. Erneuter HCI-Snoop der Canon-App zeigte eine Sequenz die wir komplett übersehen hatten:
+
+1. CCCD-Subscribes auf **acht** Channels (nicht drei wie bei uns): GPS NOTIFY, HANDOVER DATA (`00020002`, sowohl Write als auch Notify-Property), HANDOVER NOTIFY (`00020003`, Indicate), plus fünf Remote-Service-Notify-Chars (`00030001/2/11/21/31`)
+2. Write `0a` auf `00020002` (HANDOVER DATA) — Kamera antwortet mit einer Notification
+3. Write `{5, 0, 0, 0, 0, 0, 0, 0}` auf `00040002` (Source-Query — das kannten wir schon)
+4. Indication `05 04` auf `00040003` — Source = SMARTPHONE
+5. **Write `01` auf `0001000a` (PAIRING DATA)** — dies triggert die eigentliche Ready-Indication
+6. Indication `02 00` auf `00040003` — Kamera ist jetzt wirklich ready
+
+Wir hatten vorher ausschließlich die Source-Query gemacht und uns über einen STATUS-Bit-1-Shortcut in den GPS-Session-State geschoben. Das war fragil: `STATUS byte0 & 2` bedeutet nicht „Kamera ist jetzt ready", sondern „Kamera-GPS-Source war zuletzt auf Smartphone konfiguriert", und **das Bit bleibt auch im Standby gesetzt**. Wir hatten also Frames an schlafende Kameras gesendet — die zwar akzeptiert wurden, aber die halb-aufgewachte GPS-State-Machine in ihre Sensorreinigungs-Startroutine schickte (das „Klackern" beim Einschalten). Mit der echten Kickoff-Sequenz + Ready-Indication gehört das der Vergangenheit an.
+
+**Nebeneffekt**: nach dem `01`-Pairing-Write leuchtet auf der Kamera **auch das BT-Symbol** blau. Das war in Phase 5 noch ein kosmetisches offenes Ende.
+
+### Die Ready-Indication bleibt manchmal aus
+
+Nach dem Umbau auf den vollen Kickoff trat ein Folgeproblem auf: wenn die Kamera schon in einer vorigen Session `02 00` gesendet hat und wir reconnecten bevor sie in den Schlaf geht, liefert Canons Firmware **keine zweite Ready-Indication** (State hat sich aus ihrer Sicht nicht geändert). Unser Code wartete ewig, Session-State blieb auf `REQUESTING_GPS`, keine GPS-Frames wurden gesendet.
+
+Fix: beim ersten Read von `00040003` speichern wir das erste Byte. Ist es bereits `0x02` und nach dem Kickoff kommt keine frische Indication, nehmen wir das als „Kamera war bereits ready" und springen auf `GPS_SESSION_ACTIVE`. Wenn das initiale Byte etwas anderes ist (z.B. `0x05` = source-known-aber-nicht-ready), warten wir auf die echte Indication.
+
+### Wie erkennt man wach vs. schlafend — ohne zu wecken?
+
+Nächste Hürde: selbst mit korrektem Kickoff wachte die Kamera jedes Mal auf wenn wir uns zu einer schlafenden Kamera verbanden. Canons App macht das nachweislich nicht — sie connected sich zu schlafenden Kameras völlig geräuschlos. Wir brauchten also **Wake-Detection ohne Schreibzugriff**.
+
+Sackgassen:
+- **STATUS / NOTIFY initial reads** — Werte sind identisch zwischen wach und schlafend, oder zeigen cached Sessions-State. Kein Unterschied.
+- **Extra CCCD-Subscribes auf Remote-Service-Chars** — sollten uns „Kamera wach jetzt"-Notifications liefern, taten es aber nicht. Null unsolicited Indications in allen Tests.
+- **Connect-Latenz-Timing** — schlafende Kamera braucht 3–6s, wache < 200ms. Aber BLE-Advertising-Zyklen bringen Varianz rein, nicht robust genug (User hat das zurecht abgelehnt).
+- **Silent-Mode (Connect + Subscribe, keine Writes)** — Camera kappte uns nach ~10s trotzdem mit `status=19`, und selbst das bloße Subscribe auf GPS_NOTIFY löste schon eine Sensor-Aufwach-Reinigung aus.
+- **Noch silenter: nur Connect + discoverServices, null Writes** — Kamera droppte nach 2,7s mit `status=61`. Geräusche kamen trotzdem. Selbst der bare Connect weckt die R6m2 offenbar an.
+
+### Der Withings-Irrtum
+
+Im ersten Full-HCI-Snoop mit Canon-App + schlafender Kamera fanden wir einen mysteriösen „Standby-Service" mit UUID128 `0000002057495448005d000000000000` und Writes auf Handle 0x0010/0x0011. Nach einigem Starren auf UUIDs und Byte-Mustern fiel der Groschen: `57495448` ist ASCII `"WITH"` — das war die **Withings ScanWatch** des Users, die im Hintergrund mitgelaufen ist. Alle drei beobachteten `LE Create Connection`-Events gingen zu einer Random Private Address, nicht zur Canon-MAC. Canon hatte die Kamera im gesamten Log **null mal connected** — nur gescannt.
+
+Die eigentliche Erkenntnis aus diesem Schnitzer: Canon's „BT-Icon blau"-UI-State bedeutet nur **„Kamera advertiset in Reichweite"**, nicht „GATT-Verbindung steht". Canon scannt passiv und connected **nicht** bei schlafender Kamera. Das passt zum User-Bericht: Canon erkennt auch nach Battery-Pull wieder-Einstecken korrekt ohne Weckgeräusch.
+
+### Das Signal steckt im Advertisement
+
+Mit dieser Erkenntnis zurück zum HCI-Log: die Kamera advertiset, wir müssen nur passiv zuhören. Im alten Snoop fanden wir bei Canons aktiver Testsession zwei distinkte Manufacturer-Data-Payloads:
+
+```
+01 0b 33 f3 4b 02   ← 1x, genau beim Kamera-Einschalten, bevor Canon connected
+01 0b 33 f3 4b 05   ← 55x, während aller Schlafphasen
+```
+
+**Das letzte Byte** encodiert den Power-State: `0x02` = wach, `0x05` = schlafend. Die ersten fünf Bytes (`01 0b 33 f3 4b`) sind konstant, vermutlich Modell/Revision. User hat mit einem separaten BLE-Scanner-Tool verifiziert dass awake-Ads alle ~200ms kommen, asleep-Ads alle ~3s — zweite unabhängige Signatur.
+
+Manufacturer-ID ist `0x01A9` = **Murata Manufacturing** (nicht Canon Inc. = `0x0B01`, was ich erst vermutet hatte — Canon nutzt halt Murata-Module). Byte-Index ist **5** (letztes von 6 Custom-Bytes nach der Company-ID — ich hatte erst irrtümlich 3 gerechnet weil ich die Wireshark-Ausgabe falsch geparst hatte: das erste Test-Screen zeigte die UI dauerhaft auf `asleep`, weil wir Byte 3 (`0xf3`, konstant) gelesen haben, der nicht matchte → Fallback auf ASLEEP).
+
+### Scan-First-Architektur
+
+Mit dem sauberen Power-State-Signal ist die Logik komplett umgebaut:
+
+- `GpsTrackingService` startet beim Start einen `BluetoothLeScanner` (low-power, filtert per MAC in-code, nicht per ScanFilter — der ist picky bei Address-Types)
+- Jedes Advertisement wird geparst; nur wenn letztes Byte = `0x02` (wach) wird `startGattSession()` aufgerufen
+- Scanner stoppt sobald GATT aufgebaut ist (vermeidet Overhead)
+- Auf Disconnect (egal ob Kamera schlafend, Battery-Pull, Out-of-Range) → Scanner wieder an, warten auf nächstes Awake-Ad
+- Ein Watchdog flippt `cameraPower` nach 8s ohne Advertisement auf `UNSEEN` (Battery-Pull / Out-of-Range Visualisierung)
+- Beim Disconnect resettet man `lastAdvertAt` auf jetzt, damit der Watchdog nach GATT-Sessions nicht sofort fälschlich UNSEEN zeigt
+
+Live-Test-Matrix erfolgreich:
+- Kamera an + in Reichweite → automatisch Connect + Kickoff + GPS
+- Kamera aus → Scanner bleibt still, keine Geräusche, kein Connect-Versuch
+- Kamera ein → innerhalb 200ms Auto-Reconnect + Kickoff
+- Battery-Pull während Session → BLE-Supervision-Timeout (`status=19` oder `status=8`) → Scanner resumed → nach 8s Funkstille → `UNSEEN`
+- Out-of-Range → dasselbe Muster, zurück in Reichweite → Auto-Reconnect
+- Kamera aus (normal) → sauberer `awake → asleep` Übergang ohne UNSEEN-Blitz
+
+### Android-BT-Stack wird launisch nach Churn
+
+Ein beobachtetes Artefakt: nach ~20 Connect/Disconnect-Zyklen in kurzer Folge fing Androids BT-Stack an, Canon-Advertisements **gar nicht mehr** an unsere App weiterzureichen (andere BLE-Geräte kamen weiter durch). Auch danach: nach BT-Toggle Connections die nach 5s mit `status=8` wieder abbrachen. Nach ein paar Minuten Ruhe erholte sich der Stack von selbst. Das ist ein Android-Stack-Bug, nicht unserer — BT-Toggle oder kurzes Warten hilft, nichts was wir per Code verhindern können.
+
+### Stand April 2026 (Ende Phase 6)
+
+App macht in Alltag-Szenarien das was sie soll:
+- Foreground Service läuft im Hintergrund, scannt passiv
+- Keine Kamera-Weck-Geräusche mehr
+- Auto-Reconnect auf Kamera-Einschalten + Rückkehr-in-Reichweite funktioniert
+- Power-State (`awake` / `asleep` / `unseen`) in der UI sichtbar
+- RSSI-Polling während Session
+- Session-Uptime + Fix-Count + Fix-Rate live
+- GPS-Fixes landen korrekt in EXIF, BT-Icon auf Kamera leuchtet
+
+**Bewusst offen gelassen:**
+
+- Fernauslöser (`00030001` Write) — eigene Crash-Oberfläche, reizvoll aber separates Feature
+- Shutter-Counter / Batterie-Anzeige — nur via PTP-IP über WiFi zugänglich, BLE kann das nicht liefern
+- `{2}`-Request-Path bei frisch zurückgesetzter Kamera — defensiv im Code drin, weiterhin ungetestet da unsere Bond-Beziehung nie vollständig reset wurde
+- DIS-Reads reaktivieren — bräuchte einen Weg die SMP-Keys nachzuinstallieren, nicht-trivial
+
+Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die aktualisierte technische Referenz.
 
 ## Lessons Learned
 
+- **Wake-Detection gehört in die Advertisement-Payload, nicht in die Verbindung.** Die R6m2 broadcastet ihren Power-State (last byte der Murata-Manufacturer-Data unter `0x01A9`) bei jeder Advertising-Pulse. Passiv mit­lesen reicht, kein GATT, kein Wake. Canon macht das genauso — nicht verbinden, sondern scannen.
+- **Connection-Timing ist kein Signal.** BLE-Advertising-Zyklen bringen so viel Varianz rein dass „schneller Connect = wach" keine robuste Aussage ist. Korrelation mit Power-State-Byte war 1:1, Timing war es nie.
+- **Wireshark-Ausgabe ist nicht „die Bytes".** Manufacturer-Specific-Records werden halb-dekodiert dargestellt — ich habe zuerst `01 0b` als Company-ID LE gelesen (= Canon), obwohl die echte ID vor `01 0b` steckte (Murata `0xa9 01`). Was man in `Data:` sieht, sind die **Rest-Bytes nach dem Company-ID**, nicht der Anfang. Im Android-API kommt das auch so an (`getManufacturerSpecificData(companyId)` gibt die Rest-Bytes zurück). Dreimal die Bytes mit Wireshark-Packet-Tree statt mit der Flat-Ausgabe verifizieren.
+- **Prüfe ob dein BLE-Sniff wirklich von dem Gerät ist, das du glaubst.** Ich habe eine Withings-ScanWatch-Konversation als Canon-Standby-Service fehlgedeutet. Zu schnell auf UUID-ähnelndes Pattern gesprungen, nicht auf MAC-Filter bestanden. Beim nächsten Mal: Filter auf Peer-MAC **vor** der Analyse, nicht nach.
+- **Initial-Read-Werte sind nicht „jetzt", sondern „zuletzt".** `ByteBuffer`-Werte der GATT-Characteristics sind die letzten Werte die die Kamera gesendet hat — oft aus einer früheren Session. Für Live-State musst du auf `onCharacteristicChanged` warten (Notification/Indication), nicht auf `onCharacteristicRead`. Ausnahme: wenn die Kamera ihren State seit dem letzten Mal nicht gewechselt hat, sendet sie keine frische Indication → dann ist der Read-Wert das Beste was du hast. Bedeutet: wir brauchen **beide** Pfade, mit Vorrang auf die Indication.
+- **Android-BT-Stack hat ein Churn-Limit.** Nach einem Dutzend schneller Connect/Disconnect-Zyklen hört Android auf, Advertisements für eine MAC weiterzureichen. BT-Toggle oder Abwarten hilft, aber verhindern kann man es im App-Code nicht.
+- **Nicht aus User-editierbaren Feldern raten.** Der BT-Name auf der Kamera ist frei einstellbar. Modell darauf zu basen („EOSR6m2_xxx" → „Canon EOS R6 Mark II") wirkt elegant, wird aber falsch sobald jemand den Namen ändert. Lieber Feld weglassen als falsche Info zeigen.
 - **Dekompilaten nicht blind vertrauen.** Der erste Durchgang durch das Dekompilat hat uns falsche Commands (`{4} + NMEA`) plausibel gemacht, weil der wichtigste Methoden-Body von jadx übersprungen worden war — und niemand hat das "Method dump skipped" als Warnung ernst genommen. `jadx --show-bad-code` sollte **Default** sein bei Reverse Engineering, nicht Fallback.
 - **Sniff den echten Traffic so früh wie möglich.** Der Android HCI-Snoop-Log hätte uns Phasen 3-5 komplett erspart. Sobald ein proprietäres BLE-Protokoll relevant ist, ist ein Wireshark-Capture der realen Gegen-App Pflicht-Grundlagenarbeit — nicht Last Resort.
 - **Dekompilate und Wire-Format können auseinanderlaufen.** Canon setzt `ByteOrder.LITTLE_ENDIAN` über einen Code-Pfad, den jadx komplett elided hat. Im Dekompilat sah `ByteBuffer.putFloat` aus wie Big-Endian (Java-Default). Auf dem Wire ist es LE. Ohne Packet-Capture wäre das nie aufgeflogen.

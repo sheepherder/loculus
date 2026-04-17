@@ -16,10 +16,43 @@ import java.util.UUID
 private const val TAG = "CanonGatt"
 
 object CanonUuids {
+    // GPS service (0x00040000). All GPS-related reads, writes and indications.
     val GPS_SERVICE: UUID = UUID.fromString("00040000-0000-1000-0000-d8492fffa821")
     val GPS_STATUS: UUID = UUID.fromString("00040001-0000-1000-0000-d8492fffa821")
     val GPS_DATA: UUID = UUID.fromString("00040002-0000-1000-0000-d8492fffa821")
     val GPS_NOTIFY: UUID = UUID.fromString("00040003-0000-1000-0000-d8492fffa821")
+
+    // Pairing service (0x00010000). Writing 0x01 to PAIRING_DATA (0001000a) is
+    // what makes the camera commit to the GPS session — it responds with an
+    // indication [02, ...] on GPS_NOTIFY ("ready to receive"). Without this
+    // write Canon's firmware never sends the ready signal and any GPS frames
+    // we push end up waking the camera's GPS subsystem in an ill-defined state.
+    val PAIRING_SERVICE: UUID = UUID.fromString("00010000-0000-1000-0000-d8492fffa821")
+    val PAIRING_REQUEST: UUID = UUID.fromString("00010005-0000-1000-0000-d8492fffa821")
+    val PAIRING_DATA: UUID = UUID.fromString("0001000a-0000-1000-0000-d8492fffa821")
+    val PAIRING_RESPONSE: UUID = UUID.fromString("0001000b-0000-1000-0000-d8492fffa821")
+
+    // BLE→WiFi handover service (0x00020000). Canon writes 0x0a to HANDOVER_DATA
+    // right after CCCDs are enabled — it's part of the kickoff that precedes the
+    // pairing-0x01 write. We subscribe its notify/indicate channels to mirror
+    // Canon exactly even though we never actually initiate a WiFi handover.
+    val HANDOVER_SERVICE: UUID = UUID.fromString("00020000-0000-1000-0000-d8492fffa821")
+    val HANDOVER_STATE: UUID = UUID.fromString("00020001-0000-1000-0000-d8492fffa821")
+    val HANDOVER_DATA: UUID = UUID.fromString("00020002-0000-1000-0000-d8492fffa821")
+    val HANDOVER_NOTIFY: UUID = UUID.fromString("00020003-0000-1000-0000-d8492fffa821")
+
+    // Remote-control service (0x00030000). Canon subscribes NOTIFY on all five
+    // of these; we want the full subscribe set because the power on/off event
+    // very likely arrives here. 00030001 (REMOTE_STATUS) in particular is the
+    // most promising "camera is alive" channel — Canon's N.java parses state
+    // bits from its notifications.
+    val REMOTE_SERVICE: UUID = UUID.fromString("00030000-0000-1000-0000-d8492fffa821")
+    val REMOTE_STATUS: UUID = UUID.fromString("00030001-0000-1000-0000-d8492fffa821")
+    val REMOTE_EVENTS: UUID = UUID.fromString("00030002-0000-1000-0000-d8492fffa821")
+    val REMOTE_ZOOM: UUID = UUID.fromString("00030011-0000-1000-0000-d8492fffa821")
+    val REMOTE_EXPOSURE: UUID = UUID.fromString("00030021-0000-1000-0000-d8492fffa821")
+    val REMOTE_APERTURE: UUID = UUID.fromString("00030031-0000-1000-0000-d8492fffa821")
+
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 }
 
@@ -35,8 +68,7 @@ enum class ConnState {
     CONNECTING,
     DISCOVERING,
     SUBSCRIBING,
-    READY,              // connected, CCCDs enabled; GPS session not started yet
-    REQUESTING_GPS,     // 0x02 sent, waiting for [2,...] notification
+    REQUESTING_GPS,     // Canon kickoff sent, waiting for [2,…] ready indication
     GPS_SESSION_ACTIVE, // camera is ready to receive GPS frames
     STOPPING,
     DISCONNECTING,
@@ -65,11 +97,23 @@ class CanonGattClient(
     private val onLog: (String) -> Unit,
     private val onStateChange: (ConnState) -> Unit,
     private val onGpsState: (CanonGpsState) -> Unit,
+    private val onRssi: (Int) -> Unit = {},
+    private val onWriteResult: (status: Int) -> Unit = {},
 ) {
     private var gatt: BluetoothGatt? = null
     private var statusChar: BluetoothGattCharacteristic? = null
     private var dataChar: BluetoothGattCharacteristic? = null
     private var notifyChar: BluetoothGattCharacteristic? = null
+    private var pairingDataChar: BluetoothGattCharacteristic? = null
+    private var handoverDataChar: BluetoothGattCharacteristic? = null
+    private var handoverNotifyChar: BluetoothGattCharacteristic? = null
+
+    // First byte of the GPS_NOTIFY characteristic as seen on the initial read
+    // right after service discovery. We use this as a "was camera recently
+    // ready" hint — when its value is already 2 the camera treats the kickoff
+    // writes as a re-affirmation of an unchanged state and sends no fresh
+    // indication, so we wouldn't otherwise transition to GPS_SESSION_ACTIVE.
+    private var initialNotifyByte: Int = -1
 
     private val opQueue = ArrayDeque<GattOp>()
     @Volatile private var opInFlight = false
@@ -104,21 +148,8 @@ class CanonGattClient(
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
-    /**
-     * Request GPS data channel from camera.
-     *
-     * Per Canon SDK: write 0x02 to DATA characteristic. Camera will respond with a
-     * notification on NOTIFY (00040003) — when we see first byte == 2, the camera
-     * is in READY_TO_RECEIVE and we may start pushing GPS frames.
-     */
-    fun requestGps() {
-        if (state != ConnState.READY) { log("requestGps ignored, state=$state"); return }
-        val ch = dataChar ?: return
-        state = ConnState.REQUESTING_GPS
-        // 0x02 = REQUEST GPS from smartphone
-        enqueue(GattOp.Write(ch, byteArrayOf(0x02), "req GPS",
-            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
-    }
+    /** Request a fresh RSSI reading from the connected GATT link. Result arrives via onRssi. */
+    fun readRssi(): Boolean = gatt?.readRemoteRssi() ?: false
 
     /**
      * Send a GPS fix to the camera. Uses WRITE_TYPE_NO_RESPONSE — Canon does this
@@ -147,10 +178,9 @@ class CanonGattClient(
         val g = gatt
         if (g == null) { state = ConnState.IDLE; return }
         val ch = dataChar
-        val needsStop = ch != null && gpsState == CanonGpsState.READY_TO_RECEIVE
-        if (needsStop) {
+        if (ch != null && gpsState == CanonGpsState.READY_TO_RECEIVE) {
             state = ConnState.STOPPING
-            enqueue(GattOp.Write(ch!!, byteArrayOf(0x03), "stop GPS",
+            enqueue(GattOp.Write(ch, byteArrayOf(0x03), "stop GPS",
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
         } else {
             doDisconnect()
@@ -248,6 +278,8 @@ class CanonGattClient(
                 g.close()
                 if (gatt === g) gatt = null
                 statusChar = null; dataChar = null; notifyChar = null
+                pairingDataChar = null; handoverDataChar = null; handoverNotifyChar = null
+                initialNotifyByte = -1
                 gpsState = CanonGpsState.UNKNOWN
                 state = ConnState.IDLE
             }
@@ -256,35 +288,75 @@ class CanonGattClient(
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             log("onServicesDiscovered status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) { doDisconnect(); return }
-            val svc = g.getService(CanonUuids.GPS_SERVICE)
-            if (svc == null) {
+            val gpsSvc = g.getService(CanonUuids.GPS_SERVICE)
+            if (gpsSvc == null) {
                 log("GPS service not found")
-                g.services.forEach { log("  service ${it.uuid}") }
                 doDisconnect(); return
             }
-            statusChar = svc.getCharacteristic(CanonUuids.GPS_STATUS)
-            dataChar = svc.getCharacteristic(CanonUuids.GPS_DATA)
-            notifyChar = svc.getCharacteristic(CanonUuids.GPS_NOTIFY)
+            statusChar = gpsSvc.getCharacteristic(CanonUuids.GPS_STATUS)
+            dataChar = gpsSvc.getCharacteristic(CanonUuids.GPS_DATA)
+            notifyChar = gpsSvc.getCharacteristic(CanonUuids.GPS_NOTIFY)
             if (dataChar == null || notifyChar == null) {
                 log("missing GPS chars"); doDisconnect(); return
             }
-            // Canon's init sequence from C0243g: READ both STATUS and NOTIFY to pull
-            // initial state, then ENABLE NOTIFY on NOTIFY char (STATUS has no CCCD).
+            pairingDataChar = g.getService(CanonUuids.PAIRING_SERVICE)
+                ?.getCharacteristic(CanonUuids.PAIRING_DATA)
+            g.getService(CanonUuids.HANDOVER_SERVICE)?.let { hs ->
+                handoverDataChar = hs.getCharacteristic(CanonUuids.HANDOVER_DATA)
+                handoverNotifyChar = hs.getCharacteristic(CanonUuids.HANDOVER_NOTIFY)
+            }
+
             state = ConnState.SUBSCRIBING
+
+            // Initial state reads. The GPS_NOTIFY value is stashed so we can use
+            // its byte0 as a fallback if the kickoff completes without a fresh
+            // indication (happens when the camera is already in ready state).
             statusChar?.let { enqueue(GattOp.Read(it, "STATUS")) }
             notifyChar?.let { enqueue(GattOp.Read(it, "NOTIFY")) }
-            subscribe(g, notifyChar!!, "NOTIFY")
+
+            // Mirror Canon's full CCCD subscribe set (8 channels, from HCI
+            // snoop). We previously subscribed only 3; the camera's power on/off
+            // state change notifications are likely on the remote-service chars,
+            // which is where our "awake/asleep detection without writing" signal
+            // should live. All remote subscribes are passive — no writes to them.
+            subscribe(g, notifyChar!!, "GPS_NOTIFY",
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+            handoverDataChar?.let {
+                subscribe(g, it, "HANDOVER_DATA",
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            }
+            handoverNotifyChar?.let {
+                subscribe(g, it, "HANDOVER_NOTIFY",
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+            }
+            g.getService(CanonUuids.REMOTE_SERVICE)?.let { rs ->
+                listOf(
+                    CanonUuids.REMOTE_STATUS to "REMOTE_STATUS",
+                    CanonUuids.REMOTE_EVENTS to "REMOTE_EVENTS",
+                    CanonUuids.REMOTE_ZOOM to "REMOTE_ZOOM",
+                    CanonUuids.REMOTE_EXPOSURE to "REMOTE_EXPOSURE",
+                    CanonUuids.REMOTE_APERTURE to "REMOTE_APERTURE",
+                ).forEach { (uuid, label) ->
+                    rs.getCharacteristic(uuid)?.let {
+                        subscribe(g, it, label,
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                    }
+                }
+            }
         }
 
-        private fun subscribe(g: BluetoothGatt, ch: BluetoothGattCharacteristic, label: String) {
+        private fun subscribe(
+            g: BluetoothGatt,
+            ch: BluetoothGattCharacteristic,
+            label: String,
+            cccdValue: ByteArray,
+        ) {
             if (!g.setCharacteristicNotification(ch, true)) {
                 log("setCharacteristicNotification($label) returned false"); return
             }
             val desc = ch.getDescriptor(CanonUuids.CCCD)
             if (desc == null) { log("CCCD missing on $label"); return }
-            // Canon uses INDICATION (0x0200), not NOTIFICATION (0x0100). Confirmed
-            // via HCI snoop of the Canon Camera Connect app.
-            enqueue(GattOp.WriteDesc(desc, BluetoothGattDescriptor.ENABLE_INDICATION_VALUE, "CCCD $label"))
+            enqueue(GattOp.WriteDesc(desc, cccdValue, "CCCD $label"))
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -292,30 +364,42 @@ class CanonGattClient(
             opCompleted()
             if (state == ConnState.SUBSCRIBING) {
                 synchronized(opQueue) {
-                    if (opQueue.isEmpty() && !opInFlight) {
-                        // After CCCD subscribe, mirror Canon's flow: query current GPS source
-                        // (8-byte write of {5, 0, 0, 0, 0, 0, 0, 0}) before going READY.
-                        // The camera responds via indication with {5, source_byte}.
-                        val ch = dataChar
-                        if (ch != null) {
-                            log("→ querying GPS source (Canon-style 8B probe)")
-                            enqueue(GattOp.Write(ch,
-                                byteArrayOf(0x05, 0, 0, 0, 0, 0, 0, 0),
-                                "probe src=5",
-                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
-                        }
-                        state = ConnState.READY
-                    }
+                    if (opQueue.isEmpty() && !opInFlight) fireCanonKickoff()
                 }
             }
+        }
+
+        /**
+         * Canon kickoff sequence, verified against the Camera Connect app via HCI
+         * snoop. Order matters — the ready-indication 0x02 0x00 on GPS_NOTIFY only
+         * arrives after the pairing-0x01 write, and only if handover-0x0a has been
+         * sent first. Skipping any step leaves the camera in a state where GPS
+         * frames are accepted syntactically but never propagate into EXIF (GPS
+         * icon on camera stays grey/off).
+         */
+        private fun fireCanonKickoff() {
+            log("→ Canon kickoff (handover 0x0a / source query / pairing 0x01)")
+            handoverDataChar?.let {
+                enqueue(GattOp.Write(it, byteArrayOf(0x0a), "handover 0a",
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+            }
+            dataChar?.let {
+                enqueue(GattOp.Write(it,
+                    byteArrayOf(0x05, 0, 0, 0, 0, 0, 0, 0),
+                    "source query (8B)",
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+            }
+            pairingDataChar?.let {
+                enqueue(GattOp.Write(it, byteArrayOf(0x01), "pairing 01",
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+            }
+            state = ConnState.REQUESTING_GPS
         }
 
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
             log("onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${value.toHexCompact()}")
             opCompleted()
-            // Reading NOTIFY/STATUS gives us the initial state byte; route it through
-            // the same handler as a notification.
-            if (status == BluetoothGatt.GATT_SUCCESS) handleStateByte(ch, value)
+            if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, value)
         }
 
         @Deprecated("legacy pre-33")
@@ -324,17 +408,54 @@ class CanonGattClient(
             val v = ch.value ?: ByteArray(0)
             log("onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${v.toHexCompact()}")
             opCompleted()
-            if (status == BluetoothGatt.GATT_SUCCESS) handleStateByte(ch, v)
+            if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, v)
+        }
+
+        private fun routeRead(ch: BluetoothGattCharacteristic, value: ByteArray) {
+            // NOTE: do NOT drive gpsState from reads. Read values reflect the
+            // camera's last persisted state, not current aliveness. We only
+            // transition on real-time indications/notifications — but we DO
+            // remember the initial NOTIFY byte as a fallback for the case
+            // where the camera is already in a ready state and therefore
+            // doesn't re-indicate after the kickoff.
+            if (ch.uuid == CanonUuids.GPS_NOTIFY && value.isNotEmpty()) {
+                initialNotifyByte = value[0].toInt() and 0xff
+                log("  initial NOTIFY byte0=0x${"%02x".format(initialNotifyByte)}")
+            }
+            if (ch.uuid == CanonUuids.GPS_STATUS && value.isNotEmpty()) {
+                val b = value[0].toInt()
+                log("  STATUS byte0=0x${"%02x".format(b)} bit1(active)=${(b and 2) != 0}")
+            }
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
             log("onCharacteristicWrite ${shortUuid(ch.uuid)} status=$status")
+            onWriteResult(status)
             opCompleted()
             if (state == ConnState.STOPPING) {
                 synchronized(opQueue) {
                     if (opQueue.isEmpty() && !opInFlight) doDisconnect()
                 }
             }
+            // If the last kickoff write was the pairing-01 (on PAIRING_DATA), and
+            // the queue is now empty, and we're still waiting for a ready
+            // indication that never came because the camera was already in
+            // ready state — infer ready from the initial NOTIFY read.
+            if (state == ConnState.REQUESTING_GPS
+                && ch.uuid == CanonUuids.PAIRING_DATA
+                && status == BluetoothGatt.GATT_SUCCESS) {
+                synchronized(opQueue) {
+                    if (opQueue.isEmpty() && !opInFlight && initialNotifyByte == 2) {
+                        log("kickoff done, no fresh indication but initial NOTIFY=2 → assume ready")
+                        gpsState = CanonGpsState.READY_TO_RECEIVE
+                        state = ConnState.GPS_SESSION_ACTIVE
+                    }
+                }
+            }
+        }
+
+        override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) onRssi(rssi)
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
@@ -350,32 +471,27 @@ class CanonGattClient(
             handleStateByte(ch, v)
         }
 
+        /**
+         * Handle a real-time indication/notification from the camera. The
+         * ready-to-receive transition is ONLY driven by an indication [2, …]
+         * after the pairing-0x01 write. We don't trust read-values for state
+         * because they reflect persistent last-session state, not current
+         * aliveness — reading the NOTIFY char on a sleeping camera returns
+         * "0200" from its last awake session.
+         */
         private fun handleStateByte(ch: BluetoothGattCharacteristic, value: ByteArray) {
             if (value.isEmpty()) return
-            val uuid = ch.uuid
-            if (uuid == CanonUuids.GPS_NOTIFY) {
-                when (value[0].toInt()) {
-                    1 -> gpsState = CanonGpsState.STATE_1
-                    2 -> {
-                        gpsState = CanonGpsState.READY_TO_RECEIVE
-                        if (state == ConnState.REQUESTING_GPS) state = ConnState.GPS_SESSION_ACTIVE
-                    }
-                    3 -> gpsState = CanonGpsState.STATE_3
-                    5 -> {
-                        val src = if (value.size >= 2) value[1].toInt() else -1
-                        log("  camera GPS source = $src (${gpsSourceName(src)})")
-                    }
-                }
-            } else if (uuid == CanonUuids.GPS_STATUS) {
-                // STATUS char: byte 0 is a bitfield. Canon checks bit 1 (& 2) for "GPS active".
-                val b = value[0].toInt()
-                log("  STATUS byte0=0x${"%02x".format(b)} bit1(active)=${(b and 2) != 0}")
-                if ((b and 2) == 2) {
-                    // Camera is already in GPS-active state. Treat as ready.
-                    if (gpsState != CanonGpsState.READY_TO_RECEIVE) {
-                        gpsState = CanonGpsState.READY_TO_RECEIVE
-                    }
+            if (ch.uuid != CanonUuids.GPS_NOTIFY) return
+            when (value[0].toInt()) {
+                1 -> gpsState = CanonGpsState.STATE_1
+                2 -> {
+                    gpsState = CanonGpsState.READY_TO_RECEIVE
                     if (state == ConnState.REQUESTING_GPS) state = ConnState.GPS_SESSION_ACTIVE
+                }
+                3 -> gpsState = CanonGpsState.STATE_3
+                5 -> {
+                    val src = if (value.size >= 2) value[1].toInt() else -1
+                    log("  camera GPS source = $src (${gpsSourceName(src)})")
                 }
             }
         }

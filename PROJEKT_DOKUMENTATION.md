@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Reverse Engineering abgeschlossen. Android-PoC-App funktioniert auf Pixel 9a — GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert (GPS-Icon leuchtet hell nach Write).
+**Status:** Android-App produktiv. Scan-First-Architektur, vollautomatischer Auto-Reconnect bei Kamera-Einschalten / Rückkehr in Reichweite, keine Sensor-Weckgeräusche bei schlafender Kamera. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
 
-**Datum:** 2026-04-12
+**Datum:** 2026-04-17
 
 ---
 
@@ -67,24 +67,70 @@ Alle Canon-spezifischen Services/Characteristics folgen dem Muster:
 | **Data** | `00040002-0000-1000-0000-d8492fffa821` | **Write** | **GPS-Daten senden** |
 | Notify | `00040003-0000-1000-0000-d8492fffa821` | Notify | GPS-Notifications |
 
-### GPS-Kommandos
+### Advertisement-basiertes Power-State-Signal
 
-Auf Characteristic `00040002` können folgende Kommandos gesendet werden:
+Die R6m2 advertiset im Standby-Modus mit einer **anderen Advertising-Rate und einem State-Byte** als im aktiven Modus. Beide Signale sind unabhängig voneinander beobachtbar durch reines Scannen — kein Connect, kein ATT-Write, kein Wake-Risiko.
+
+**Manufacturer Specific Data** unter Company-ID `0x01A9` (Bluetooth SIG assigned zu **Murata Manufacturing** — Canon verwendet Murata-Module, daher nicht die eigene Canon-ID `0x0B01`):
+
+```
+Byte 0..4   konstant  01 0b 33 f3 4b   (vermutlich Modell/Revision-Kennung)
+Byte 5      variabel  0x02 = AWAKE (Kamera voll eingeschaltet)
+                       0x05 = ASLEEP (Kamera in BLE-Standby)
+                       anderes → konservativ als ASLEEP behandeln
+```
+
+Zusätzliche Signatur (redundant, aber stabil):
+- Awake: Advertisement-Rate ~200ms (5–6 Ads/s)
+- Asleep: Advertisement-Rate ~3s
+
+**Konsequenz für die Logik**: wir connecten ausschließlich wenn ein frisches Advertisement Byte 5 = `0x02` zeigt. Schlafende Kameras bleiben unberührt.
+
+Android-API: `ScanResult.scanRecord.getManufacturerSpecificData(0x01A9)` liefert die 6 Bytes *nach* der Company-ID.
+
+### Connect- und Kickoff-Sequenz
+
+Verifiziert via HCI-Snoop der offiziellen Canon Camera Connect App, mehrfach reproduziert auf R6m2:
+
+1. **CCCD-Subscribes** (8 Channels, in dieser Reihenfolge spielt's keine Rolle):
+
+   | UUID | Char | CCCD |
+   |------|------|------|
+   | `00040003` | GPS NOTIFY | `02 00` INDICATE |
+   | `00020002` | HANDOVER DATA | `01 00` NOTIFY |
+   | `00020003` | HANDOVER NOTIFY | `02 00` INDICATE |
+   | `00030001` | Remote STATUS | `01 00` NOTIFY |
+   | `00030002` | Remote EVENTS | `01 00` NOTIFY |
+   | `00030011` | Remote ZOOM | `01 00` NOTIFY |
+   | `00030021` | Remote EXPOSURE | `01 00` NOTIFY |
+   | `00030031` | Remote APERTURE | `01 00` NOTIFY |
+
+2. **Write `0x0a` auf `00020002`** (HANDOVER DATA, WRITE_TYPE_DEFAULT). Kamera antwortet mit einer Notification auf derselben Char mit ~20-Byte-Payload (vermutlich Capability-Handshake).
+
+3. **Write `0x05 00 00 00 00 00 00 00` auf `00040002`** (GPS DATA, Source-Query, 8 Byte). Kamera antwortet via Indication auf `00040003` mit `05 xx` wobei `xx` die aktive Source ist (`04` = Smartphone).
+
+4. **Write `0x01` auf `0001000a`** (PAIRING DATA, WRITE_TYPE_DEFAULT). Dies ist der tatsächliche Trigger für die Ready-Indication. Nebeneffekt: das **BT-Symbol** auf dem Kamera-Display leuchtet blau.
+
+5. **Indication `02 00` auf `00040003`** (GPS NOTIFY) = Kamera ist bereit GPS-Frames zu empfangen.
+
+6. Ab jetzt: **`0x04 + 19 Byte GPS-Fix` auf `00040002`** mit WRITE_TYPE_NO_RESPONSE, Rate Canon-seitig ~15s, wir machen 10s.
+
+**Initial-NOTIFY-Fallback**: Wenn wir bei einer schon warmen Kamera reconnecten (Kamera war in derselben Sitzung bereits ready), schickt sie keine frische `02 00`-Indication weil sich aus ihrer Sicht nichts geändert hat. Wir merken uns deshalb beim ersten Read von `00040003` das Byte 0 — ist es bereits `0x02` und nach dem Pairing-Write kommt keine Indication, nehmen wir das als Ready und gehen in `GPS_SESSION_ACTIVE`.
+
+### GPS-Kommandos auf `00040002`
 
 | Byte(s) | Write-Type | Bedeutung | Quelle im Dekompilat |
 |---------|-----------|-----------|----------------------|
 | `0x01` | DEFAULT | GPS deaktivieren | `C0275o.I()` mit i5=1 |
 | `0x02` | DEFAULT | GPS von Smartphone anfordern | `C0275o.I()` mit i5=2 |
-| `0x03` | DEFAULT | GPS stoppen | `C0275o.I()` mit i5=3 |
+| `0x03` | DEFAULT | GPS stoppen (Session-Ende, vor Disconnect) | `C0275o.I()` mit i5=3 |
 | `0x04 <19 Byte binary>` | **NO_RESPONSE** | GPS-Fix senden (20 Byte binary format, siehe unten) | `d4.C0500A.G(Location)` |
-| `0x05` | DEFAULT | Aktuelle GPS-Quelle abfragen (Response via NOTIFY) | `C0298u.a()` auto-probe |
-| `0x06 0xNN 0x00*6` (8 Byte!) | DEFAULT | GPS-Quelle setzen: `0x00`=disable, `0x01`=externer Empfänger, `0x04`=Smartphone | `Z3/j.java:181-187` |
+| `0x05 <7 Byte 0>` | DEFAULT | Source-Query (Teil des Kickoffs, siehe oben) | `C0298u.a()` |
+| `0x06 0xNN 0x00*6` | DEFAULT | GPS-Quelle setzen: `0x00`=disable, `0x01`=externer Empfänger, `0x04`=Smartphone | `Z3/j.java:181-187` |
 
 **Write-Type-Regeln:**
-- Kommandos (`0x01`, `0x02`, `0x03`, `0x05`, `0x06 0xNN...`) → `WRITE_TYPE_DEFAULT` (mit Response)
+- Kommando-Writes → `WRITE_TYPE_DEFAULT` (mit Response)
 - GPS-Fix (`0x04 + 19 Byte`) → `WRITE_TYPE_NO_RESPONSE` (keine Bestätigung)
-
-**Wichtig zum Source-Set-Kommando:** Canon allociert `ByteBuffer.allocate(8)` und schreibt nur die ersten 2 Bytes — der Rest bleibt 0. Effektiv werden also **8 Byte** gesendet: `[0x06, src, 0, 0, 0, 0, 0, 0]`. Ob die Kamera mit nur 2 Byte glücklich ist, wurde nicht getestet — besser Canons Format spiegeln.
 
 ### GPS-Datenformat
 
@@ -125,15 +171,19 @@ Encoder-Code: siehe `android/app/src/main/java/de/schaefer/eosgps/CanonGpsFrame.
 
 **Warum das wichtig ist:** Unsere frühen Versuche mit NMEA-Text-Frames (~140 Byte pro Update) haben die Kamera-Firmware mehrfach gecrashed — die Bytes nach dem `0x04`-Kommando wurden vom Parser als binärer Payload interpretiert, und die falschen Werte brachten die GPS-State-Machine in einen Zustand, aus dem sie nicht mehr rauskam (Busy-Lock, Reboot). Siehe `ENTWICKLUNGSVERLAUF.md` für die Story.
 
-### Pairing-Protokoll
+### Pairing-Protokoll (Erst-Pairing)
 
-Canon verwendet ein proprietäres Pairing über GATT (nicht Standard Bluetooth Pairing):
+Canon verwendet ein proprietäres Pairing über GATT (nicht Standard Bluetooth Pairing). Für das **initiale** Pairing (vom User über die Canon-App gemacht):
 
 1. BLE-Verbindung herstellen (ohne System-Pairing)
 2. Notifications auf `0001000b` aktivieren
 3. Pairing-Request senden: `0x03` + Gerätename (ASCII) auf `00010005`
 4. Auf Kamera bestätigen
 5. Response `0x02` = Erfolg
+
+**Wichtig**: dieses Canon-Pairing installiert **keine SMP-Keys** im Android-Bond-Store. Der Bond-Record existiert, aber ohne Encryption-Keys. Konsequenz: verschlüsselte Standard-Chars wie DIS (`0x180a`) lassen sich nicht lesen — Android's automatische Encryption-Escalation scheitert und bricht die Verbindung ab (HCI 0x3D, „MAC Connection Failed"). DIS bleibt für uns tabu; Modell/Firmware-Informationen sind über BLE nicht zugänglich.
+
+Für die hier beschriebene Use-Case (unsere App nutzt existierende Bond-Beziehung) ist das Pairing-Protokoll nicht nötig — Canon-App hat die Bond bereits eingerichtet, wir erben sie.
 
 ---
 
@@ -195,19 +245,54 @@ pip install bleak
 
 ### Android-App (`android/`)
 
-Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon.
+Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon. **Scan-First-Architektur** — der Foreground Service scannt passiv auf Canon-Advertisements und connected nur wenn das Power-State-Byte awake meldet.
 
-**Status (2026-04-12):**
-- GATT Connect auf gebondete Canon: ✅
-- Service-Discovery (Canon GPS Service `0004`): ✅
-- Initial-State via READ 00040001 + READ 00040003: ✅
-- CCCD-INDICATION-Subscribe auf 00040003 (`0x0200`): ✅
-- Source-Query + Indikations-Response: ✅
+**Status (2026-04-17):**
+- Scan-First Foreground Service: ✅
+- Power-State aus Advertisement parsen (Byte 5 unter Company-ID `0x01A9`): ✅
+- Auto-Connect bei Awake-Advertisement: ✅
+- Canon-Kickoff-Sequenz (8 CCCDs + `0x0a`-Handover + Source-Query + `0x01`-Pairing): ✅
+- BT-Icon auf Kamera leuchtet blau (durch Pairing-`01`-Write): ✅
+- Initial-NOTIFY-Fallback für bereits-ready-Kameras: ✅
 - GPS-Frame-Write (20 Byte binary LE, WRITE_NO_RESPONSE): ✅
-- Foreground Service + FusedLocationProvider Auto-Loop: ✅
-- 60+ Sekunden kontinuierliche Session ohne Firmware-Crash: ✅
 - Graceful Stop mit `{3}` + Disconnect: ✅
-- **EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert**: ✅
+- FusedLocationProvider Auto-Loop (10s-Rate): ✅
+- Auto-Reconnect bei Kamera-Einschalten / Out-of-Range / Battery-Pull-Recovery: ✅
+- Advertisement-Staleness-Watchdog → `UNSEEN` nach 8s Funkstille: ✅
+- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count: ✅
+- EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert: ✅
+
+**Architekturübersicht:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   GpsTrackingService                        │
+│  (Foreground Service, startet bei User-Start)               │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│   BluetoothLeScanner ──► scanCallback                       │
+│   (unfiltert, MAC-Filter im Code)                           │
+│                             │                               │
+│                             ▼                               │
+│                    handleAdvertisement()                    │
+│                    parse byte 5 of mfg data                 │
+│                             │                               │
+│                AWAKE ──────┤├──────── ASLEEP / andere       │
+│                             │                               │
+│                             ▼                               │
+│                     startGattSession()                      │
+│                             │                               │
+│                             ▼                               │
+│     CanonGattClient ── state machine ──► GPS_SESSION_ACTIVE │
+│                             │                               │
+│                             ▼                               │
+│     FusedLocation → sendGps(20B Frame, NO_RESPONSE)         │
+│                                                             │
+│   onDisconnect ──► resume scan                              │
+│   staleness watchdog ──► UNSEEN nach 8s ohne Ad            │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
 
 **Build/Install:**
 ```bash
@@ -218,84 +303,12 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 **Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
 
-**Offen:**
-- [ ] Auto-Reconnect wenn Kamera aus/an geht (jetzt: manueller Restart)
-- [ ] `{2}`-Path testen gegen eine frisch zurückgesetzte Kamera (bisher war READY_TO_RECEIVE schon aus vorheriger Canon-App-Session gesetzt)
-- [ ] Optional: Pairing-Service-Handshake machen damit BT-Icon auf Kamera leuchtet (kosmetisch)
-- [ ] Optional: auch Speed/Bearing aus Location übertragen — Format noch nicht bekannt
-
----
-
-## Geplante Architektur
-
-### Für Android (Zielplattform)
-
-```
-┌────────────────────────────────────────────────────────────┐
-│                     CanonGPSSync App                        │
-├────────────────────────────────────────────────────────────┤
-│                                                            │
-│  ┌──────────────────┐    ┌────────────────────────────┐   │
-│  │ Foreground       │    │ BLE Scanner                │   │
-│  │ Service          │───▶│ - Scan for Canon cameras   │   │
-│  │ (mit Notification)│   │ - Filter: d8492fffa821     │   │
-│  └──────────────────┘    └────────────────────────────┘   │
-│           │                          │                     │
-│           ▼                          ▼                     │
-│  ┌──────────────────┐    ┌────────────────────────────┐   │
-│  │ Location Provider │    │ BLE Connection Manager    │   │
-│  │ - GPS updates     │───▶│ - GATT connect            │   │
-│  │ - Fused Location  │    │ - Service discovery       │   │
-│  └──────────────────┘    │ - Write characteristics   │   │
-│                          └────────────────────────────┘   │
-│                                      │                     │
-│                                      ▼                     │
-│                          ┌────────────────────────────┐   │
-│                          │ NMEA Generator             │   │
-│                          │ - GPGGA + GPRMC            │   │
-│                          │ - Checksum calculation     │   │
-│                          └────────────────────────────┘   │
-│                                                            │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Ablauf
-
-1. **App startet als Foreground Service** (überlebt Battery Optimization)
-2. **Periodischer BLE-Scan** nach Canon Service UUID
-3. **Kamera erkannt** → GATT-Verbindung herstellen
-4. **GPS aktivieren** → Write `0x06 0x04` auf `00040002`
-5. **GPS-Daten senden** → NMEA-Sentences auf `00040002` (alle 1-10 Sekunden)
-6. **Verbindung verloren** → Zurück zu Schritt 2
-
-### Wichtig für Android
-
-- Die App kann die **bestehenden Pairing-Credentials** der Canon Camera Connect App nutzen
-- Das Bluetooth-Pairing wird vom **Android-System verwaltet**, nicht von einzelnen Apps
-- Kein erneutes Pairing nötig, wenn Kamera bereits mit dem Handy gepairt ist
-
----
-
-## Nächste Schritte
-
-### Kurzfristig (nach neuem BT-Adapter)
-
-1. [ ] Neuen Bluetooth-Adapter kaufen und installieren
-2. [ ] `python canon_gps_poc.py pair` testen
-3. [ ] `python canon_gps_poc.py send` testen
-4. [ ] Protokoll mit nRF Connect App auf Handy verifizieren (BLE Sniffer)
-
-### Mittelfristig
-
-5. [ ] Python-Script auf Termux (Android) testen
-6. [ ] Android-App mit Kotlin/Jetpack Compose entwickeln
-7. [ ] Foreground Service implementieren
-8. [ ] Automatische Reconnection implementieren
-
-### Optional
-
-- [ ] ESP32-basierte Hardware-Lösung (unabhängig vom Handy)
-- [ ] iOS-App (falls gewünscht)
+**Bewusst nicht implementiert / offene TODOs:**
+- [ ] Fernauslöser (`00030001` Write) — eigene Crash-Oberfläche, separates Feature
+- [ ] Batterie / Shutter-Counter — nur via PTP-IP über WiFi, BLE liefert das nicht
+- [ ] `{2}`-Path testen (frisch reset'd Kamera) — defensive Logik im Code, ungetestet
+- [ ] DIS-Reads — bräuchte SMP-Key-Installation, HCI 0x3D Disconnect bei Encryption-Escalation
+- [ ] Speed/Bearing im GPS-Frame — Canon speichert das nur lokal, nicht im 20-Byte-BLE-Format
 
 ---
 
@@ -362,4 +375,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-04-12*
+*Letzte Aktualisierung: 2026-04-17*
