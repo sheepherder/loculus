@@ -65,6 +65,11 @@ class GpsTrackingService : Service() {
     @Volatile private var scanning = false
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
     private var lastSentAt = 0L
+    // UI time = last advertisement seen; watchdog time = last camera contact of
+    // any kind (advertisement OR active GATT session). Split so the UI doesn't
+    // falsely claim "adv 0s ago" right after a disconnect, while the watchdog
+    // still doesn't flip UNSEEN during transitions.
+    @Volatile private var watchdogAnchorMs: Long = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val rssiPollRunnable = object : Runnable {
@@ -74,19 +79,15 @@ class GpsTrackingService : Service() {
         }
     }
 
-    // Flip cameraPower to UNSEEN when we go too long without an advertisement
-    // while not connected — covers battery-pull, out-of-range and physical-off
-    // scenarios where neither a BLE disconnect nor a new ad arrives. Skipped
-    // while a GATT session is active (the camera doesn't advertise then, so
-    // stale lastAdvertAt is expected).
+    // Flip cameraPower to UNSEEN after too long without any contact. Covers
+    // battery-pull / out-of-range / physical-off where no disconnect fires.
     private val staleWatchdog = object : Runnable {
         override fun run() {
-            val lastAt = TrackingState.lastAdvertAt.value
             val cur = TrackingState.cameraPower.value
-            if (gatt == null && lastAt != null && cur != CameraPowerState.UNSEEN) {
-                val elapsed = SystemClock.elapsedRealtime() - lastAt
+            if (gatt == null && watchdogAnchorMs > 0 && cur != CameraPowerState.UNSEEN) {
+                val elapsed = SystemClock.elapsedRealtime() - watchdogAnchorMs
                 if (elapsed > AD_STALENESS_THRESHOLD_MS) {
-                    TrackingState.log("no adv for ${elapsed / 1000}s → unseen")
+                    TrackingState.log("no contact for ${elapsed / 1000}s → unseen")
                     TrackingState.cameraPower.value = CameraPowerState.UNSEEN
                     updateNotification()
                 }
@@ -104,7 +105,6 @@ class GpsTrackingService : Service() {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            Log.d(TAG, "scan: ${result.device.address} mfg=${result.scanRecord?.manufacturerSpecificData}")
             handleAdvertisement(result)
         }
 
@@ -154,6 +154,7 @@ class GpsTrackingService : Service() {
         }
         TrackingState.serviceRunning.value = true
         TrackingState.resetSession()
+        watchdogAnchorMs = 0L
 
         val device = findBondedCanon()
         if (device == null) {
@@ -236,7 +237,7 @@ class GpsTrackingService : Service() {
         if (!result.device.address.equals(target, ignoreCase = true)) return
         val mfg = result.scanRecord?.getManufacturerSpecificData(CANON_COMPANY_ID) ?: return
         if (mfg.size <= POWER_BYTE_INDEX) return
-        TrackingState.lastAdvertAt.value = SystemClock.elapsedRealtime()
+        markAdvertisement()
         val powerByte = mfg[POWER_BYTE_INDEX]
         val newState = when (powerByte) {
             STATE_AWAKE -> CameraPowerState.AWAKE
@@ -297,11 +298,28 @@ class GpsTrackingService : Service() {
         gatt = null
         TrackingState.rssi.value = null
         TrackingState.sessionStartedAt.value = null
-        // Refresh the staleness clock: we were in contact via GATT right up
-        // to this moment, so the watchdog shouldn't treat the pre-connection
-        // lastAdvertAt (which can be minutes old) as evidence of silence.
-        TrackingState.lastAdvertAt.value = SystemClock.elapsedRealtime()
+        markContact()
         if (TrackingState.serviceRunning.value) startScan()
+    }
+
+    /** Bumps the watchdog clock — called whenever we confirm the camera is reachable. */
+    private fun markContact() {
+        watchdogAnchorMs = SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * Bumps both clocks on real advertisement reception. `lastAdvertAt` is
+     * rate-limited to 1s: the UI only renders rounded seconds, so sub-second
+     * writes would trigger recompositions at scan rate (~6/s awake) with no
+     * visible effect.
+     */
+    private fun markAdvertisement() {
+        val now = SystemClock.elapsedRealtime()
+        watchdogAnchorMs = now
+        val prev = TrackingState.lastAdvertAt.value
+        if (prev == null || now - prev >= 1000L) {
+            TrackingState.lastAdvertAt.value = now
+        }
     }
 
     // --- Location ---

@@ -135,7 +135,9 @@ fun AppScreen() {
                 StatusDot(color = powerStateColor(cameraPower))
                 Spacer(Modifier.width(6.dp))
                 MonoText(cameraPower.name.lowercase())
-                if (lastAdvertAt != null) {
+                // Camera stops advertising during a GATT session; hide the
+                // age then so it doesn't grow meaninglessly.
+                if (lastAdvertAt != null && connState == ConnState.IDLE) {
                     Spacer(Modifier.width(8.dp))
                     Text(
                         "adv ${formatDuration(nowTick - lastAdvertAt!!)} ago",
