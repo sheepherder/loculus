@@ -353,6 +353,96 @@ App macht in Alltag-Szenarien das was sie soll:
 
 Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die aktualisierte technische Referenz.
 
+## Phase 7 — Echter Auto-Start und Hintergrund-Leben (April 2026)
+
+Nach Phase 6 war die App funktional komplett, aber der User musste sie nach jedem Handy-Neustart manuell öffnen und „Start" drücken. Damit lief die App faktisch genauso umständlich wie die Canon-App selbst — der Hauptnutzen der passiven Scan-First-Architektur verpuffte. Phase 7 hat das korrigiert, und dabei einige Android-14+-Fallstricke freigelegt, die wir in Phase 6 noch nicht ansteuern mussten.
+
+### Strategieentscheidung: PendingIntent-Scan statt Dauer-Foreground-Service
+
+Der naive Weg wäre gewesen: `BOOT_COMPLETED`-Receiver, der den bestehenden Foreground Service 24/7 anstarrt. Das hätte aber einerseits die UX verhunzt (Dauer-Notification auch wenn die Kamera eine Woche nicht bewegt wird) und andererseits die Batterie mit dauerhaft laufendem BLE-Scan belastet — 2–5 %/Tag im Leerlauf, selbst mit `SCAN_MODE_LOW_POWER`.
+
+Stattdessen nutzen wir jetzt Androids **PendingIntent-basierten Offloaded-Scan**: `BluetoothLeScanner.startScan(filters, settings, pendingIntent)` registriert einen Filter im System, der im BT-Chip / BT-HAL läuft. Wenn ein Match kommt, broadcastet Android an den `ScanResultReceiver`, der kann dann gezielt den Foreground Service hochfahren — nur für echte Wake-Events.
+
+Batterie-Impact im Leerlauf: <0,5 %/Tag. Keine 24/7-Notification. Die App-Prozess schläft die meiste Zeit, wir haben nur einen Manifest-Receiver der beim Match getriggert wird.
+
+### Der Hardware-Filter: nur auf das, was wir verstehen
+
+Der HW-Filter nutzt `setManufacturerData(0x01A9, data, mask)`. Erste Version war strict: alle 6 Bytes exakt matchen. Das war falsch:
+
+- Byte 0–4 kannten wir nur empirisch auf genau einer R6m2 (`01 0b 33 f3 4b`) — unverifiziert ob das zwischen Firmware-Versionen oder Exemplaren konstant ist.
+- In Byte 5 kannten wir nur zwei Werte: `0x02` (awake) und `0x05` (asleep). Die unterscheiden sich nur in den unteren 3 Bits (`010` vs `101`); was die oberen 5 Bits je machen könnten, wissen wir nicht.
+
+Finale Filter-Maske: `data=[0,0,0,0,0,0x02]`, `mask=[0,0,0,0,0,0x07]`. Also ignoriere Bytes 0–4 komplett, und in Byte 5 matche nur die unteren 3 Bits. Das folgt direkt der Phase-6-Lesson: **nicht auf unverifizierte Felder bauen**. Wenn Canon irgendwann ein Flag-Bit dort oben setzt — kein Problem, wir matchen weiter.
+
+MAC-Filter bewusst NICHT im HW-Filter: `ScanFilter.setDeviceAddress(String, int)` mit explizitem Address-Type ist `@SystemApi` (nur System-Apps). Die 1-Argument-Variante ohne Address-Type ist historisch pickig. Ein fremder Canon in Reichweite würde uns also theoretisch aufwecken — das ist selten, Broadcasts sind billig, und `ScanResultReceiver` filtert die MAC in Code. Ein Filter pro Stage, nicht zwei.
+
+### Android 14+ Foreground-Service-Fallstricke
+
+Erste Hürde nach dem Feature-Build: Service-Crash-Schleife. Stack-Trace zeigte:
+
+```
+SecurityException: Starting FGS with type location … and the app must be
+in the eligible state/exemptions to access the foreground only permission
+```
+
+Auf Android 14+ darf ein FGS vom Typ `location` nur starten, wenn die App in einem „eligible state" ist (User-Interaktion, sichtbare Activity). Ein Scan-Broadcast ist das nicht. Der bestehende `location|connectedDevice`-Service aus Phase 6 war durch manuelles „Start"-Drücken immer eligible — Phase 7 hat diese Annahme gesprengt.
+
+Erste Korrektur: FGS-Typ auf nur `connectedDevice` reduziert. Crash weg, Service startet. Aber: FusedLocationProvider liefert im Hintergrund keine Updates mehr, sobald MainActivity nicht sichtbar ist — die App gilt als „in background", ohne `location`-FGS-Typ kein Background-Location-Zugriff.
+
+Lösung: `ACCESS_BACKGROUND_LOCATION` als explizite Exemption dazunehmen. Damit kann der FGS wieder `location|connectedDevice` sein, ohne eligibility-Check. Runtime-Flow dafür muss zweistufig sein (Android 11+): erst FINE/COARSE regulär, dann separater Request für Background, der den User in System-Settings auf „Immer zulassen" lenkt.
+
+UI zeigt einen orangefarbenen Hinweis „Hintergrund-Ortung: ohne 'Immer zulassen' kommen Fixes nur wenn App offen ist" solange die Permission fehlt. Der Service selbst wählt den FGS-Typ zur Laufzeit — `hasBackgroundLocation()` true → mit `location`, sonst ohne.
+
+### Edge-Detection im OS-Scan
+
+`CALLBACK_TYPE_FIRST_MATCH` feuert nur an Zustandsübergängen des internen Match-Engines: `lost → found`. Solange ein Gerät als „found" gilt, kommt kein weiterer Broadcast. Nach `MATCH_MODE_AGGRESSIVE`-Timeout ohne Match fällt der State auf „lost". Erste neue Ad = neue Kante = neuer Broadcast.
+
+Problem: wenn die Kamera während unserer aktiven GATT-Session + 30s-Reconnect-Grace durchgehend awake ist (keine Advertisements, weil connected), könnte der Scan-Engine die Session als „found, ongoing" sehen. Nach Service-Ende bleibt der State „found" → keine weitere FIRST_MATCH-Kante, obwohl die Kamera immer noch awake ist.
+
+Fix: beim Handoff vom Service zurück in den Idle-Modus (`reconnectGiveup`) wird der Scan **re-armed** — `unregister` + `register` setzen den Edge-Detection-State zurück. Nächste awake-Ad ist garantiert eine neue Kante.
+
+### 30-Minuten-Limit auf den internen Scan
+
+Android drosselt jeden direkten `ScanCallback`-Scan nach ~30 Minuten automatisch auf `SCAN_MODE_OPPORTUNISTIC` — lautlos, keine Warnung. In unserer Architektur ist das normal egal: der interne Scan läuft nur in kurzen Fenstern (initial bei Manual-Start, 30s Reconnect-Grace). Aber: wenn ein User „besonders clever" sein will und bei aktivem Auto-Start zusätzlich manuell „Start" drückt weil er denkt das beschleunigt was — dann läuft der interne Scan statt des OS-Scans, und nach 30 Min still gedrosselt.
+
+Fix: Hard-Cap von 2 Minuten auf den internen Scan. Danach automatisch Handoff: wenn OS-Scan registriert → re-arm + exit, sonst nur exit (User merkt am fehlenden Notification dass nichts mehr läuft, keine stille Verstockung).
+
+### Ein leerer ScanResult — und was er über PendingIntent-Scans verrät
+
+Als die ersten Broadcasts reinkamen, zeigte unser Debug-Log ein verstörendes Bild:
+
+```
+result addr=34:90:EA:7B:C1:93 rssi=0 mfg01A9=null b5=n/a
+```
+
+MAC stimmte. Aber `scanRecord` komplett leer — kein RSSI, kein Mfg-Data. Der anfängliche Receiver-Code hatte byte 5 nochmal als Defense-in-Depth gecheckt — das matchte natürlich nicht, die Broadcasts wurden verworfen.
+
+Erklärung: Android liefert bei PendingIntent-basierten Offloaded-Scans oft eine **verschlankte ScanResult** in den Intent-Extras. Der BT-HAL hat die komplette Ad ausgewertet und gegen den HW-Filter gematched, aber für die Broadcast-Zustellung wird nur das Device-Objekt (MAC) erhalten. `rssi=0` ist ein dead giveaway.
+
+Konsequenz-Entscheidung (User hat mich da zurechtgewiesen): **zwei unterschiedliche Filter in HW und Code sind Code-Smell**. Der HW-Filter hat das awake-Matching schon gemacht, sonst käme gar kein Broadcast. Der Receiver-Code filtert ausschließlich MAC — das Datum ist in `ScanResult.device.address` verlässlich da, unabhängig vom verschlankten `scanRecord`. Ein Filter pro Stage, klare Rollen.
+
+### Interner Scan bekam einen HW-Filter spendiert
+
+Der interne Service-Scan aus Phase 6 lief `startScan(emptyList(), …)` — kein HW-Filter, alle Ads weltweit kamen rein und wurden im Code gefiltert. Historisch durch einen Kommentar begründet dass `setDeviceAddress` pickig sei (war aber ein MAC-Filter-Problem, nicht `setManufacturerData`).
+
+Phase-7-Cleanup: HW-Filter auf Canon-Company-ID (`0x01A9`, alle Ads dieser Company, beide Power-States) im internen Scan. Fremdbeacons werden schon im Chip verworfen. Power-State-Decoding (awake/asleep für UI-Anzeige + Staleness-Watchdog) bleibt im Code, aber auf low-3-Bit-Logik umgestellt — konsistent mit der HW-Filter-Philosophie.
+
+Die gemeinsamen Konstanten wanderten in eine neue `CanonAd.kt` — `COMPANY_ID`, `POWER_BYTE_INDEX`, `AWAKE_MFG_DATA/MASK`, `powerStateFromByte()`. Beide Scan-Pfade importieren dieselbe Quelle der Wahrheit.
+
+### Stand April 2026 (Ende Phase 7)
+
+App ist jetzt wirklich Alltag-fertig:
+
+- Scan-Registrierung überlebt Boot + App-Update (BootReceiver auf BOOT_COMPLETED, LOCKED_BOOT_COMPLETED, MY_PACKAGE_REPLACED)
+- Auto-Start-Toggle in der UI, persistiert in SharedPreferences
+- Battery-Optimization-Exemption-Prompt + Background-Location-Prompt mit klaren UI-Warnungen
+- Connect nur noch wenn Kamera awake (HW-gefiltert), keine CPU-Arbeit für schlafende oder fremde BLE-Geräte
+- 30s Reconnect-Grace mit schnellem Re-Connect, dann Handoff an OS-Scan
+- 2min Timeout auf den internen Scan, nie in Android-30-Min-Drosselung
+- GPS-Updates funktionieren mit geschlossener Activity, durch `connectedDevice|location`-FGS + BACKGROUND_LOCATION
+
+Die Phase-7-Lessons sind unten im erweiterten Lessons-Learned-Abschnitt dokumentiert.
+
 ## Nachbetrachtung — was wir rückblickend hätten wissen können
 
 Nach Abschluss von Phase 6 haben wir die Literaturrecherche gemacht die wir vor Projektstart hätten machen sollen. Ergebnisse, geordnet nach Überlappung mit unserem Projekt:
@@ -423,3 +513,10 @@ Wäre ein dankbarer PR an `gkoh/furble` um dort die Canon-Scan-Robustheit mit de
 - **Bestehende System-Pairing-Beziehungen sind Gold wert.** Die Pixel-Kamera-Bond war schon durch Canons eigene App eingerichtet. Eine neue App konnte den GATT-Connect direkt aufbauen, ohne sich mit Canons proprietärem Pairing-Protokoll beschäftigen zu müssen.
 - **Firmware-Crashes ernst nehmen.** Die R6m2 hat unsere Fehler mehrfach mit Hangs und Self-Reset bestraft. Nach dem zweiten Crash war die korrekte Reaktion nicht "anderes Timing probieren" sondern **komplett stoppen und die Grundannahmen prüfen**. Das haben wir erst beim fünften Crash konsequent gemacht — hätten wir nach dem ersten.
 - **Hardware-Probleme nicht um jeden Preis umgehen wollen.** Der CSR-Adapter blockierte Phase 1 komplett — der Umstieg auf das Pixel war die schnellere Lösung als ein neuer Adapter plus Neutest, und das Zielgerät ist ohnehin das Handy.
+- **PendingIntent-Scan statt Foreground-Dauerscan für Idle-Beobachtung.** Android hat die API `startScan(filters, settings, pendingIntent)` genau für Beacon-/Companion-Apps gebaut: der Scan läuft im System, broadcastet nur beim Match, der App-Prozess darf schlafen. Keine 30-Min-Drosselung, kein Dauer-FGS, kein Dauer-Notification. Die klassische Foreground-Service-mit-ScanCallback-Lösung ist für „immer an, wartet passiv" der falsche Hammer.
+- **Ein Filter pro Stage, nicht zwei.** Bei zwei Scan-Pfaden (HW + Code) konsequent aufteilen: HW-Filter entscheidet *was* durchgelassen wird, Code-Filter entscheidet *welches* Gerät wir meinen. Dasselbe Kriterium in beiden Stages prüfen ist Code-Smell — und wenn die Daten in einer Stage nicht zuverlässig verfügbar sind (wie der leere `scanRecord` im PendingIntent-Broadcast), führt Duplikation zu stillen Fehlern.
+- **Android 14+ FGS-Typen sind Access-Tokens, keine Tags.** Der FGS-Typ `location` darf nur gesetzt werden wenn die App eligible ist (User-Interaktion oder Background-Location-Permission). Ein Broadcast-Trigger ist nicht eligible. Konsequenz: `connectedDevice`-only reicht für Scan-wake-GATT, aber für Background-Location braucht man entweder sichtbare Activity *oder* `ACCESS_BACKGROUND_LOCATION` als Exemption. In Cross-Check: FGS-Typ bestimmt was die App während des FGS *darf*, nicht was sie ist.
+- **`CALLBACK_TYPE_FIRST_MATCH` ist edge-triggered — die Kante kann verlorengehen.** Wenn ein Device während einer aktiven Verbindung nicht advertisen kann, fällt sein Match-State beim OS auf „lost", erste Ad nach Disconnect = neue Kante = neuer Broadcast. Wenn es aber durchgehend advertiset (z.B. während wir im Reconnect-Grace-Scan sind), kann es als dauerhaft „found" gelten — keine weitere Kante mehr. Beim Handoff zurück in den Idle-Modus deshalb `unregister` + `register`, um den Edge-Detection-State zu resetten.
+- **Scan-Callback-Varianten haben unterschiedliche Haltbarkeit.** Direkte `ScanCallback`s werden nach ~30 Minuten auf `SCAN_MODE_OPPORTUNISTIC` gedrosselt. PendingIntent-basierte nicht. Wenn der interne Scan in einer App länger als wenige Minuten laufen darf, in Richtung stummer Nicht-Funktion. Immer Hard-Timeout setzen und zurück auf PendingIntent-Pfad handen.
+- **PendingIntent-Scan liefert reduzierte ScanResults.** Im Broadcast sind `rssi`, `scanRecord.bytes`, `getManufacturerSpecificData()` oft alle null oder leer — nur `device.address` ist verlässlich da. Wer auf detaillierte Payload-Daten im Receiver angewiesen ist, hat ein Problem. Dem HW-Filter vertrauen oder auf direkten `ScanCallback` umsteigen.
+- **Bash-Pipes schlucken Exit-Codes.** `gradle | tail && adb install` läuft auch bei BUILD FAILED weiter, weil `tail` immer 0 zurückgibt, wenn es lesen konnte. Ergebnis: alter APK bleibt auf dem Gerät, Änderungen scheinen nicht zu greifen, Debug-Runde für Nichts. Entweder `set -o pipefail` oder `gradle > /tmp/x.log 2>&1 && adb install …; tail /tmp/x.log` — Exit-Code muss direkt vom Builder kommen.

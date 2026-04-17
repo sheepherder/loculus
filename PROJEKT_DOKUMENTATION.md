@@ -4,7 +4,7 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Android-App produktiv. Scan-First-Architektur, vollautomatischer Auto-Reconnect bei Kamera-Einschalten / Rückkehr in Reichweite, keine Sensor-Weckgeräusche bei schlafender Kamera. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
+**Status:** Android-App produktiv. Zwei-stufige Scan-Architektur: OS-offloaded PendingIntent-Scan im Idle-Modus (kein Foreground-Service nötig, <0,5 %/Tag Batterie), direkter ScanCallback nur während aktiver Session und 30s Reconnect-Grace. Auto-Start nach Boot und App-Update. Auto-Reconnect bei Kamera-Einschalten / Rückkehr in Reichweite, keine Sensor-Weckgeräusche bei schlafender Kamera. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
 
 **Datum:** 2026-04-17
 
@@ -251,51 +251,76 @@ pip install bleak
 Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon. **Scan-First-Architektur** — der Foreground Service scannt passiv auf Canon-Advertisements und connected nur wenn das Power-State-Byte awake meldet.
 
 **Status (2026-04-17):**
-- Scan-First Foreground Service: ✅
-- Power-State aus Advertisement parsen (Byte 5 unter Company-ID `0x01A9`): ✅
+- OS-offloaded PendingIntent-Scan für Idle-Detection (byte5 low-3-bits gefiltert im HW): ✅
+- Interner ScanCallback nur während aktiver Session + 30s Reconnect-Grace (HW-Filter auf Company-ID): ✅
+- Auto-Start nach Boot, Package-Update, und App-Update: ✅
+- Power-State aus Advertisement parsen (Byte 5 unter Company-ID `0x01A9`, low-3-bit-Logik): ✅
 - Auto-Connect bei Awake-Advertisement: ✅
 - Canon-Kickoff-Sequenz (8 CCCDs + `0x0a`-Handover + Source-Query + `0x01`-Pairing): ✅
 - BT-Icon auf Kamera leuchtet blau (durch Pairing-`01`-Write): ✅
 - Initial-NOTIFY-Fallback für bereits-ready-Kameras: ✅
 - GPS-Frame-Write (20 Byte binary LE, WRITE_NO_RESPONSE): ✅
 - Graceful Stop mit `{3}` + Disconnect: ✅
-- FusedLocationProvider Auto-Loop (10s-Rate): ✅
+- FusedLocationProvider Auto-Loop (10s-Rate), funktioniert auch bei geschlossener Activity durch FGS-Typ `location|connectedDevice` + `ACCESS_BACKGROUND_LOCATION` Exemption: ✅
 - Auto-Reconnect bei Kamera-Einschalten / Out-of-Range / Battery-Pull-Recovery: ✅
+- Re-Arm des OS-Scans beim Handoff (Edge-State-Reset): ✅
+- 2-Min-Hard-Cap auf internen Scan (gegen Android-30-Min-Throttling): ✅
 - Advertisement-Staleness-Watchdog → `UNSEEN` nach 8s Funkstille: ✅
-- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count: ✅
+- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Auto-Start-Toggle, Battery-Opt- und Background-Location-Prompts: ✅
 - EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert: ✅
 
 **Architekturübersicht:**
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   GpsTrackingService                        │
-│  (Foreground Service, startet bei User-Start)               │
-├─────────────────────────────────────────────────────────────┤
+┌──────────── IDLE (App-Prozess schläft) ─────────────────────┐
 │                                                             │
-│   BluetoothLeScanner ──► scanCallback                       │
-│   (unfiltert, MAC-Filter im Code)                           │
+│   BootReceiver ─► CanonScanRegistrar.register(ctx)         │
 │                             │                               │
 │                             ▼                               │
-│                    handleAdvertisement()                    │
-│                    parse byte 5 of mfg data                 │
+│   BluetoothLeScanner.startScan(filter, pendingIntent)       │
+│   HW-Filter: Canon mfg id 0x01A9 + byte5 low3 = 010         │
+│   Läuft im System-Prozess, kein FGS nötig, kein 30min-Limit │
 │                             │                               │
-│                AWAKE ──────┤├──────── ASLEEP / andere       │
-│                             │                               │
-│                             ▼                               │
-│                     startGattSession()                      │
+│   ─── Kamera geht an → erste awake-Ad ───                   │
 │                             │                               │
 │                             ▼                               │
-│     CanonGattClient ── state machine ──► GPS_SESSION_ACTIVE │
-│                             │                               │
-│                             ▼                               │
-│     FusedLocation → sendGps(20B Frame, NO_RESPONSE)         │
+│   ScanResultReceiver.onReceive()                            │
+│   Verifiziert MAC im Code, startForAwakeAd()                │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────── AKTIV (GpsTrackingService FGS) ────────────────────┐
 │                                                             │
-│   onDisconnect ──► resume scan                              │
-│   staleness watchdog ──► UNSEEN nach 8s ohne Ad            │
+│   startTracking(awakeHint=true)                             │
+│   FGS-Typ: connectedDevice + (location wenn BG-Perm)        │
+│   Interner BluetoothLeScanner (HW-Filter: Canon mfg id)     │
+│   2-Min-Hard-Cap gegen Android-30-Min-Drosselung            │
+│                             │                               │
+│                             ▼                               │
+│   handleAdvertisement() — MAC + byte5 → AWAKE state         │
+│                             │                               │
+│                             ▼                               │
+│   CanonGattClient ── state machine ──► GPS_SESSION_ACTIVE   │
+│                             │                               │
+│                             ▼                               │
+│   FusedLocation → sendGps(20B Frame, NO_RESPONSE)           │
 │                                                             │
+│   onGattDisconnected() → interner Scan (30s Reconnect-Grace)│
+│     └─ Kamera kehrt zurück: sofortiger Reconnect            │
+│     └─ Timeout: unregister + register (Edge-Reset) → exit   │
+│                                                             │
+│   staleness watchdog ──► UNSEEN nach 8s ohne Ad             │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**Filter-Matrix:**
+
+|                    | HW-Filter                      | Code-Filter            |
+|--------------------|--------------------------------|------------------------|
+| Idle (OS-Scan)     | Canon mfg id + byte5 low3 awake | MAC                    |
+| Aktiv (intern)     | Canon mfg id                   | MAC + byte5 → State    |
+
+Idle-Stage bekommt nur Awake-Ads, Service wird nur für echte Wake-Events aufgeweckt. Aktiver Stage sieht beide Power-States (awake/asleep) für UI und Staleness-Watchdog. Konstanten gemeinsam in `CanonAd.kt`.
 
 **Build/Install:**
 ```bash
@@ -306,12 +331,29 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 **Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
 
+**Kotlin-Dateien:**
+
+```
+android/app/src/main/java/de/schaefer/eosgps/
+├── MainActivity.kt         Compose UI, Permission-Flow, Auto-Start-Toggle
+├── GpsTrackingService.kt   Foreground Service, State-Machine
+├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff
+├── CanonGpsFrame.kt        20-Byte-Binär-Encoder
+├── CanonAd.kt              Scan-Konstanten + powerStateFromByte()
+├── CanonScanRegistrar.kt   OS-Scan-Registration mit HW-Filter + PendingIntent
+├── ScanResultReceiver.kt   Broadcast-Receiver für HW-Filter-Matches
+├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm
+├── Prefs.kt                SharedPreferences-Wrapper (autoStart, scanRegistered)
+└── TrackingState.kt        StateFlows (Service ↔ UI)
+```
+
 **Bewusst nicht implementiert / offene TODOs:**
 - [ ] Fernauslöser (`00030001` Write) — eigene Crash-Oberfläche, separates Feature
 - [ ] Batterie / Shutter-Counter — nur via PTP-IP über WiFi, BLE liefert das nicht
 - [ ] `{2}`-Path testen (frisch reset'd Kamera) — defensive Logik im Code, ungetestet
 - [ ] DIS-Reads — bräuchte SMP-Key-Installation, HCI 0x3D Disconnect bei Encryption-Escalation
 - [ ] Speed/Bearing im GPS-Frame — Canon speichert das nur lokal, nicht im 20-Byte-BLE-Format
+- [ ] Setup-Flow / Multi-Camera — siehe `IDEEN_FUER_SPAETER.md`
 
 ---
 

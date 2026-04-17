@@ -6,10 +6,14 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,6 +39,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -43,6 +49,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -52,6 +59,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -93,7 +103,31 @@ fun AppScreen() {
     val sessionStart by TrackingState.sessionStartedAt.collectAsState()
     val lastFixAt by TrackingState.lastFixAt.collectAsState()
     val writeErrors by TrackingState.writeErrors.collectAsState()
+    val scanRegistered by TrackingState.scanRegistered.collectAsState()
     val log by TrackingState.lastLog.collectAsState()
+
+    // Auto-start toggle state. Persisted in Prefs; UI state just mirrors it
+    // so the switch responds instantly and we sync Prefs on click.
+    var autoStartEnabled by remember { mutableStateOf(Prefs.autoStartEnabled(ctx)) }
+    var batteryOptIgnored by remember { mutableStateOf(isBatteryOptIgnored(ctx)) }
+    var backgroundLocationGranted by remember { mutableStateOf(hasBackgroundLocation(ctx)) }
+
+    // Re-read on every resume — the user might have just returned from
+    // the system Settings screen where they toggled battery optimization
+    // or granted background location.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                batteryOptIgnored = isBatteryOptIgnored(ctx)
+                backgroundLocationGranted = hasBackgroundLocation(ctx)
+                autoStartEnabled = Prefs.autoStartEnabled(ctx)
+                TrackingState.scanRegistered.value = Prefs.scanRegistered(ctx)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // Ticker so elapsed-time displays refresh once per second while a session
     // runs. Cheap — only a handful of Text recompositions.
@@ -110,6 +144,15 @@ fun AppScreen() {
     ) { results ->
         permsGranted = results.values.all { it }
         if (permsGranted) bondedCanon = findBondedCanon(ctx)
+    }
+
+    // Background-location has to be asked for separately on Android 11+ —
+    // the system dialog triggered by this request steers the user to
+    // Settings with "Allow all the time".
+    val backgroundLocationLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        backgroundLocationGranted = granted
     }
 
     LaunchedEffect(permsGranted) {
@@ -198,6 +241,72 @@ fun AppScreen() {
             if (writeErrors > 0) {
                 KeyValueRow("errors") {
                     MonoText("$writeErrors", color = Color(0xFFE57373))
+                }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        InfoCard("Auto-Start") {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    MonoText(if (autoStartEnabled) "on" else "off", bold = true)
+                    val statusLine = when {
+                        !autoStartEnabled -> "manual start only"
+                        scanRegistered -> "listening in background"
+                        else -> "registration pending"
+                    }
+                    Text(
+                        statusLine,
+                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = autoStartEnabled,
+                    enabled = permsGranted && bondedCanon != null,
+                    onCheckedChange = { want ->
+                        autoStartEnabled = want
+                        Prefs.setAutoStartEnabled(ctx, want)
+                        if (want) {
+                            val ok = CanonScanRegistrar.register(ctx)
+                            if (!ok) TrackingState.log("auto-start: scan registration failed")
+                        } else {
+                            CanonScanRegistrar.unregister(ctx)
+                        }
+                    },
+                    colors = SwitchDefaults.colors(),
+                )
+            }
+            if (autoStartEnabled && !batteryOptIgnored) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Akku-Optimierung ausschalten, sonst throttelt Android den Scan",
+                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                    color = Color(0xFFFFB74D),
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedButton(onClick = { requestBatteryOptExemption(ctx) }) {
+                    Text("Akku-Optimierung öffnen")
+                }
+            }
+            if (autoStartEnabled && !backgroundLocationGranted) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Hintergrund-Ortung: ohne 'Immer zulassen' kommen Fixes nur wenn App offen ist",
+                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                    color = Color(0xFFFFB74D),
+                )
+                Spacer(Modifier.height(4.dp))
+                OutlinedButton(onClick = {
+                    backgroundLocationLauncher.launch(
+                        Manifest.permission.ACCESS_BACKGROUND_LOCATION
+                    )
+                }) {
+                    Text("Hintergrund-Ortung freigeben")
                 }
             }
         }
@@ -371,4 +480,21 @@ private fun allPerms(): Array<String> {
 
 private fun hasAllPerms(ctx: Context): Boolean = allPerms().all {
     ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
+}
+
+private fun hasBackgroundLocation(ctx: Context): Boolean =
+    ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+        PackageManager.PERMISSION_GRANTED
+
+private fun isBatteryOptIgnored(ctx: Context): Boolean {
+    val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+    return pm.isIgnoringBatteryOptimizations(ctx.packageName)
+}
+
+@SuppressLint("BatteryLife")
+private fun requestBatteryOptExemption(ctx: Context) {
+    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        .setData(Uri.fromParts("package", ctx.packageName, null))
+        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    ctx.startActivity(intent)
 }

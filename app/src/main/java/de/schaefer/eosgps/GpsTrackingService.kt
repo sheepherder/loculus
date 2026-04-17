@@ -44,25 +44,22 @@ private const val RSSI_POLL_INTERVAL_MS = 5_000L
 // range, powered off via the switch beyond BLE-standby).
 private const val AD_STALENESS_THRESHOLD_MS = 8_000L
 private const val STALENESS_CHECK_INTERVAL_MS = 2_000L
+// When a GATT session drops (camera went to standby, briefly out of range,
+// etc.) we keep the foreground service alive for this window and run the
+// internal LOW_LATENCY scan, so a quick reconnect is instantaneous. After
+// the window we hand off to the OS-offloaded scan (CanonScanRegistrar) and
+// let the service exit, so the notification disappears when the camera is
+// genuinely gone.
+private const val RECONNECT_GRACE_MS = 30_000L
+// Hard cap on the foreground LOW_LATENCY scan. Android silently downgrades
+// any direct-ScanCallback scan to SCAN_MODE_OPPORTUNISTIC after ~30 min,
+// which would make a camera wake-up go unnoticed. We bail out much earlier
+// than that and either hand off to the OS scan or exit the service, so the
+// user never ends up in a half-dead "scan running, nothing happens" state.
+private const val INTERNAL_SCAN_MAX_MS = 120_000L
 
-// Canon BLE advertisement decoding. Company ID 0x01A9 is Canon Inc. (assigned
-// by the Bluetooth SIG — not Murata, which is 0x013C; Canon uses Murata BLE
-// modules physically but signs its advertisements with its own ID).
-// Android's getManufacturerSpecificData returns 6 bytes after the company-id
-// prefix — e.g. "01 0b 33 f3 4b 05" on our R6m2. Bytes 0-4 are constant on
-// this model (likely protocol version + model-family code; unverified without
-// a second body to compare). Byte 5 is the power state, verified by HCI
-// snoops:
-//   0x02 = camera fully on (safe to connect + kickoff)
-//   0x05 = camera in BLE standby (connecting + writing would wake it)
-// This power-state byte is not decoded by any public Canon-BLE reverse-
-// engineering project (checked Nov 2026: canoremote, cannon-bluetooth-remote,
-// ESP32-Canon-BLE-Remote, eos-remote-web, gkoh/furble). furble decodes a
-// similar byte for Sony cameras but matches Canon only by service UUID.
-private const val CANON_COMPANY_ID = 0x01A9
-private const val STATE_AWAKE: Byte = 0x02
-private const val STATE_ASLEEP: Byte = 0x05
-private const val POWER_BYTE_INDEX = 5
+// Canon advertisement decoding lives in CanonAd.kt — shared between the
+// OS-offloaded scan (CanonScanRegistrar) and the in-service scan.
 
 class GpsTrackingService : Service() {
 
@@ -140,20 +137,47 @@ class GpsTrackingService : Service() {
                 stopTracking()
                 return START_NOT_STICKY
             }
-            else -> startTracking()
+            else -> {
+                val awakeHint = intent?.getBooleanExtra(EXTRA_AWAKE_AD_HINT, false) == true
+                startTracking(awakeHint)
+            }
         }
-        return START_STICKY
+        // NOT_STICKY — the offloaded scan re-wakes us on the next advertisement,
+        // so we don't want Android to auto-restart us after a crash or kill.
+        // (An earlier START_STICKY caused a crash-loop when the Android 14
+        // FGS type validation rejected location-type starts from the broadcast.)
+        return START_NOT_STICKY
     }
 
     // --- Lifecycle ---
 
     @SuppressLint("MissingPermission")
-    private fun startTracking() {
-        if (TrackingState.serviceRunning.value) return
+    private fun startTracking(awakeHint: Boolean = false) {
+        // Awake hint means the OS-offloaded scan already observed an
+        // awake-shaped advertisement right before starting us; we can skip
+        // the self-run scan and dive straight into GATT.
+        if (TrackingState.serviceRunning.value) {
+            // Service already running (e.g. during the reconnect grace
+            // window). Cancel any pending giveup and keep going.
+            mainHandler.removeCallbacks(reconnectGiveup)
+            return
+        }
 
         val notif = buildNotification("Scanning for camera…")
-        val types = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION or
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        // FGS type selection on Android 14+:
+        //   - `connectedDevice` is always safe: we target a bonded BT device.
+        //   - `location` additionally unlocks FusedLocationProvider while
+        //     the app itself is in the background — but the platform only
+        //     lets us declare `location` when we either have foreground UI
+        //     (not the case when started from a scan broadcast) or we hold
+        //     ACCESS_BACKGROUND_LOCATION as an exemption.
+        // Without `location`, location updates only flow while MainActivity
+        // is visible. So we add it whenever the user granted background
+        // location — then GPS works even with the screen off.
+        var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        if (hasBackgroundLocation()) {
+            types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+        }
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTIF_ID, notif, types)
         } else {
@@ -172,14 +196,24 @@ class GpsTrackingService : Service() {
         bondedDevice = device
 
         startLocationUpdates()
-        startScan()
         mainHandler.postDelayed(staleWatchdog, STALENESS_CHECK_INTERVAL_MS)
+
+        if (awakeHint) {
+            TrackingState.log("started by awake-ad → connecting directly")
+            TrackingState.cameraPower.value = CameraPowerState.AWAKE
+            markAdvertisement()
+            startGattSession()
+        } else {
+            startScan()
+        }
     }
 
     private fun stopTracking() {
         Log.i(TAG, "stopTracking")
         mainHandler.removeCallbacks(rssiPollRunnable)
         mainHandler.removeCallbacks(staleWatchdog)
+        mainHandler.removeCallbacks(reconnectGiveup)
+        mainHandler.removeCallbacks(scanTimeout)
         fused.removeLocationUpdates(locationCallback)
         stopScan()
         gatt?.stopAndDisconnect()
@@ -196,6 +230,8 @@ class GpsTrackingService : Service() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(rssiPollRunnable)
         mainHandler.removeCallbacks(staleWatchdog)
+        mainHandler.removeCallbacks(reconnectGiveup)
+        mainHandler.removeCallbacks(scanTimeout)
         fused.removeLocationUpdates(locationCallback)
         stopScan()
         gatt?.stopAndDisconnect()
@@ -214,17 +250,27 @@ class GpsTrackingService : Service() {
         val s = mgr.adapter?.bluetoothLeScanner
         if (s == null) { TrackingState.log("no BLE scanner available"); return }
         scanner = s
-        // Scan without a ScanFilter for now: Android's ScanFilter.setDeviceAddress
-        // is sometimes picky about address type (Public vs Random) and can silently
-        // suppress all callbacks. We filter by MAC in handleAdvertisement instead.
+        // HW-filter by Canon company id so foreign beacons don't wake the
+        // callback. No byte-5 constraint here (unlike the OS scan): we want
+        // to observe both power states so the UI and staleness watchdog see
+        // awake ↔ asleep transitions live. MAC is still matched in code —
+        // ScanFilter.setDeviceAddress is unreliable for public addresses
+        // without the @SystemApi address-type variant.
+        // Empty data + empty mask = "match any advertisement carrying the
+        // given company id". No single-arg overload exists for this case.
+        val filter = ScanFilter.Builder()
+            .setManufacturerData(CanonAd.COMPANY_ID, ByteArray(0), ByteArray(0))
+            .build()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
         try {
-            s.startScan(emptyList(), settings, scanCallback)
+            s.startScan(listOf(filter), settings, scanCallback)
             scanning = true
-            TrackingState.log("→ scanning (unfiltered, matching ${device.address} in code)")
+            mainHandler.removeCallbacks(scanTimeout)
+            mainHandler.postDelayed(scanTimeout, INTERNAL_SCAN_MAX_MS)
+            TrackingState.log("→ scanning (HW: Canon mfg only; MAC ${device.address} in code)")
             Log.i(TAG, "startScan started for ${device.address}")
         } catch (e: SecurityException) {
             TrackingState.log("scan perm denied: ${e.message}")
@@ -235,22 +281,37 @@ class GpsTrackingService : Service() {
     @SuppressLint("MissingPermission")
     private fun stopScan() {
         if (!scanning) return
+        mainHandler.removeCallbacks(scanTimeout)
         try { scanner?.stopScan(scanCallback) } catch (_: Exception) {}
         scanning = false
+    }
+
+    /**
+     * Hard-stop the internal scan before Android silently downgrades it to
+     * SCAN_MODE_OPPORTUNISTIC at ~30 min. If the OS scan is registered, we
+     * hand off (re-arm for a fresh edge, then exit the service). Otherwise
+     * we exit and leave the user to start again — at least no silent decay.
+     */
+    private val scanTimeout = Runnable {
+        if (!scanning || gatt != null) return@Runnable
+        val ctx = applicationContext
+        if (Prefs.scanRegistered(ctx)) {
+            TrackingState.log("internal scan timed out (${INTERNAL_SCAN_MAX_MS / 60000}min) → hand off to OS scan")
+            CanonScanRegistrar.unregister(ctx)
+            CanonScanRegistrar.register(ctx)
+        } else {
+            TrackingState.log("internal scan timed out — stopping to avoid silent throttling")
+        }
+        stopTracking()
     }
 
     private fun handleAdvertisement(result: ScanResult) {
         val target = bondedDevice?.address ?: return
         if (!result.device.address.equals(target, ignoreCase = true)) return
-        val mfg = result.scanRecord?.getManufacturerSpecificData(CANON_COMPANY_ID) ?: return
-        if (mfg.size <= POWER_BYTE_INDEX) return
+        val mfg = result.scanRecord?.getManufacturerSpecificData(CanonAd.COMPANY_ID) ?: return
+        if (mfg.size <= CanonAd.POWER_BYTE_INDEX) return
         markAdvertisement()
-        val powerByte = mfg[POWER_BYTE_INDEX]
-        val newState = when (powerByte) {
-            STATE_AWAKE -> CameraPowerState.AWAKE
-            STATE_ASLEEP -> CameraPowerState.ASLEEP
-            else -> CameraPowerState.ASLEEP  // unknown → treat as "don't wake"
-        }
+        val newState = CanonAd.powerStateFromByte(mfg[CanonAd.POWER_BYTE_INDEX])
         val prev = TrackingState.cameraPower.value
         if (prev != newState) {
             TrackingState.cameraPower.value = newState
@@ -299,14 +360,46 @@ class GpsTrackingService : Service() {
 
     private fun onGattDisconnected() {
         // GATT dropped (camera went to standby, moved out of range, etc.).
-        // Release the client and return to advertisement scanning so we can
-        // auto-reconnect when the camera next flips to awake.
+        // Keep the service alive for a short grace window with the internal
+        // LOW_LATENCY scan running — a quick off/on cycle is the common case
+        // and we want to reconnect instantly. If nothing re-arrives within
+        // the window, stopSelf() and let the OS-offloaded scan handle the
+        // next wake.
         mainHandler.removeCallbacks(rssiPollRunnable)
         gatt = null
         TrackingState.rssi.value = null
         TrackingState.sessionStartedAt.value = null
         markContact()
-        if (TrackingState.serviceRunning.value) startScan()
+        if (!TrackingState.serviceRunning.value) return
+        startScan()
+        mainHandler.removeCallbacks(reconnectGiveup)
+        mainHandler.postDelayed(reconnectGiveup, RECONNECT_GRACE_MS)
+    }
+
+    /**
+     * Fires after [RECONNECT_GRACE_MS] post-disconnect. If we still have no
+     * GATT session, hand off to the offloaded system scan and exit: this
+     * drops the notification and removes all CPU/BLE work from our process
+     * while the OS wakes us only when the camera advertises awake again.
+     *
+     * Important: re-arm the system scan before exiting. The OS scan engine
+     * tracks per-filter match state — if the camera stayed awake throughout
+     * our session and grace window, the engine may still see it as "found"
+     * and never emit another FIRST_MATCH edge. Unregister + register resets
+     * that state so the next awake ad reliably wakes us.
+     */
+    private val reconnectGiveup = Runnable {
+        if (gatt == null && TrackingState.serviceRunning.value) {
+            val ctx = applicationContext
+            if (Prefs.scanRegistered(ctx)) {
+                TrackingState.log("reconnect grace elapsed → re-arm OS scan, hand off")
+                CanonScanRegistrar.unregister(ctx)
+                CanonScanRegistrar.register(ctx)
+                stopTracking()
+            }
+            // If scanRegistered is false, user is in foreground-only mode —
+            // keep running, the internal scan stays on.
+        }
     }
 
     /** Bumps the watchdog clock — called whenever we confirm the camera is reachable. */
@@ -380,6 +473,11 @@ class GpsTrackingService : Service() {
         return adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }
     }
 
+    private fun hasBackgroundLocation(): Boolean =
+        ContextCompat.checkSelfPermission(this,
+            Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+
     private fun createNotificationChannel() {
         val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val ch = NotificationChannel(CHANNEL_ID, "EOS GPS Tracking",
@@ -423,9 +521,21 @@ class GpsTrackingService : Service() {
 
     companion object {
         const val ACTION_STOP = "de.schaefer.eosgps.STOP"
+        const val EXTRA_AWAKE_AD_HINT = "de.schaefer.eosgps.AWAKE_AD_HINT"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, GpsTrackingService::class.java)
+            ContextCompat.startForegroundService(ctx, i)
+        }
+
+        /**
+         * Called by [ScanResultReceiver] after the OS-offloaded scan
+         * observed an awake-shaped advertisement. The service skips its
+         * own scan and jumps straight to GATT when this hint is set.
+         */
+        fun startForAwakeAd(ctx: Context) {
+            val i = Intent(ctx, GpsTrackingService::class.java)
+                .putExtra(EXTRA_AWAKE_AD_HINT, true)
             ContextCompat.startForegroundService(ctx, i)
         }
 
