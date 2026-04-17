@@ -15,18 +15,10 @@ private const val TAG = "CanonScanReg"
  * Registers a system-offloaded BLE scan with the OS so that the Canon camera's
  * awake-advertisement wakes our app without us holding a foreground service.
  *
- * The filter matches any device whose Canon-manufacturer-data (company id
- * `0x01A9`) byte 5 is an "awake"-shaped value (low 3 bits = 0b010 = `0x02`).
- * Asleep advertisements (byte 5 = `0x05`, low 3 bits = `0b101`) are filtered
- * out in hardware and never wake the app.
- *
- * MAC is intentionally not part of the hardware filter. The only public
- * `ScanFilter.setDeviceAddress(String)` variant is picky about implicit
- * address-type guessing; the 2-argument `setDeviceAddress(String, int)` that
- * would fix it is `@SystemApi` and only available to privileged apps. We
- * tolerate that foreign Canon cameras in range can trigger the receiver —
- * they're rare, broadcasts are cheap, and [ScanResultReceiver] re-verifies
- * MAC in code before doing any real work.
+ * The filter matches only our bonded Canon (public MAC, Murata OUI) AND
+ * byte 5 of the Canon-manufacturer-data (company id `0x01A9`) being
+ * "awake"-shaped (low 3 bits = 0b010 = `0x02`). Asleep ads, foreign Canon
+ * cameras, and every other BLE device get dropped in hardware.
  */
 object CanonScanRegistrar {
 
@@ -54,6 +46,7 @@ object CanonScanRegistrar {
         }
 
         val filter = ScanFilter.Builder()
+            .setDeviceAddress(target.address)
             .setManufacturerData(CanonAd.COMPANY_ID, CanonAd.AWAKE_MFG_DATA, CanonAd.AWAKE_MFG_MASK)
             .build()
 

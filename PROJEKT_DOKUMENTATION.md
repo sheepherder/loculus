@@ -315,12 +315,12 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 
 **Filter-Matrix:**
 
-|                    | HW-Filter                      | Code-Filter            |
-|--------------------|--------------------------------|------------------------|
-| Idle (OS-Scan)     | Canon mfg id + byte5 low3 awake | MAC                    |
-| Aktiv (intern)     | Canon mfg id                   | MAC + byte5 → State    |
+|                    | HW-Filter                              | Code-Filter         |
+|--------------------|----------------------------------------|---------------------|
+| Idle (OS-Scan)     | MAC + Canon mfg id + byte5 low3 awake  | —                   |
+| Aktiv (intern)     | MAC + Canon mfg id                     | byte5 → State       |
 
-Idle-Stage bekommt nur Awake-Ads, Service wird nur für echte Wake-Events aufgeweckt. Aktiver Stage sieht beide Power-States (awake/asleep) für UI und Staleness-Watchdog. Konstanten gemeinsam in `CanonAd.kt`.
+Idle-Stage bekommt nur Awake-Ads der eigenen Kamera, Service wird nur für echte Wake-Events aufgeweckt. Aktiver Stage sieht beide Power-States (awake/asleep) für UI und Staleness-Watchdog. Konstanten gemeinsam in `CanonAd.kt`. Die MAC-Filterung findet in beiden Pfaden in Hardware statt — `ScanFilter.setDeviceAddress(String)` funktioniert für Canons public MAC sauber, der ältere Phase-6-Verdacht dass die 1-arg-Variante silently suppress hätte, war ein Aberglaube.
 
 **Build/Install:**
 ```bash

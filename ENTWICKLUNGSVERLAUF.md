@@ -374,7 +374,7 @@ Der HW-Filter nutzt `setManufacturerData(0x01A9, data, mask)`. Erste Version war
 
 Finale Filter-Maske: `data=[0,0,0,0,0,0x02]`, `mask=[0,0,0,0,0,0x07]`. Also ignoriere Bytes 0–4 komplett, und in Byte 5 matche nur die unteren 3 Bits. Das folgt direkt der Phase-6-Lesson: **nicht auf unverifizierte Felder bauen**. Wenn Canon irgendwann ein Flag-Bit dort oben setzt — kein Problem, wir matchen weiter.
 
-MAC-Filter bewusst NICHT im HW-Filter: `ScanFilter.setDeviceAddress(String, int)` mit explizitem Address-Type ist `@SystemApi` (nur System-Apps). Die 1-Argument-Variante ohne Address-Type ist historisch pickig. Ein fremder Canon in Reichweite würde uns also theoretisch aufwecken — das ist selten, Broadcasts sind billig, und `ScanResultReceiver` filtert die MAC in Code. Ein Filter pro Stage, nicht zwei.
+MAC-Filter zunächst bewusst NICHT im HW-Filter: `setDeviceAddress(String, int)` mit explizitem Address-Type ist `@SystemApi`, die 1-Argument-Variante war in Phase 6 als pickig kommentiert worden. Die Annahme hat sich im Nachtest aber nicht bestätigen lassen: Canons MAC ist public (Murata-OUI im IEEE-Register), Android 12+ löst das mit dem 1-arg-`setDeviceAddress(mac)` sauber auf. Nach der Verifikation ist die MAC jetzt in beiden Scan-Pfaden Teil des HW-Filters — keine Weck-Broadcasts mehr für fremde Canon-Kameras, und der MAC-Check im Receiver-Code entfiel ersatzlos. Lesson: Annahmen aus vorigen Phasen nicht als Fakten übernehmen ohne Nachtest.
 
 ### Android 14+ Foreground-Service-Fallstricke
 

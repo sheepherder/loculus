@@ -249,15 +249,11 @@ class GpsTrackingService : Service() {
         val s = mgr.adapter?.bluetoothLeScanner
         if (s == null) { TrackingState.log("no BLE scanner available"); return }
         scanner = s
-        // HW-filter by Canon company id so foreign beacons don't wake the
-        // callback. No byte-5 constraint here (unlike the OS scan): we want
-        // to observe both power states so the UI and staleness watchdog see
-        // awake ↔ asleep transitions live. MAC is still matched in code —
-        // ScanFilter.setDeviceAddress is unreliable for public addresses
-        // without the @SystemApi address-type variant.
-        // Empty data + empty mask = "match any advertisement carrying the
-        // given company id". No single-arg overload exists for this case.
+        // HW-filter: bonded Canon MAC + Canon company id. No byte-5
+        // constraint — we want to see both power states so the UI +
+        // staleness watchdog see awake ↔ asleep transitions live.
         val filter = ScanFilter.Builder()
+            .setDeviceAddress(device.address)
             .setManufacturerData(CanonAd.COMPANY_ID, ByteArray(0), ByteArray(0))
             .build()
         val settings = ScanSettings.Builder()
@@ -269,7 +265,7 @@ class GpsTrackingService : Service() {
             scanning = true
             mainHandler.removeCallbacks(scanTimeout)
             mainHandler.postDelayed(scanTimeout, INTERNAL_SCAN_MAX_MS)
-            TrackingState.log("→ scanning (HW: Canon mfg only; MAC ${device.address} in code)")
+            TrackingState.log("→ scanning (HW-filtered to ${device.address} + Canon mfg)")
             Log.i(TAG, "startScan started for ${device.address}")
         } catch (e: SecurityException) {
             TrackingState.log("scan perm denied: ${e.message}")
@@ -304,8 +300,6 @@ class GpsTrackingService : Service() {
     }
 
     private fun handleAdvertisement(result: ScanResult) {
-        val target = bondedDevice?.address ?: return
-        if (!result.device.address.equals(target, ignoreCase = true)) return
         val mfg = result.scanRecord?.getManufacturerSpecificData(CanonAd.COMPANY_ID) ?: return
         if (mfg.size <= CanonAd.POWER_BYTE_INDEX) return
         markAdvertisement()
