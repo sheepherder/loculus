@@ -30,7 +30,6 @@ import com.google.android.gms.location.Priority
 private const val TAG = "GpsService"
 private const val CHANNEL_ID = "eos-gps-tracking"
 private const val NOTIF_ID = 42
-private const val MIN_SEND_INTERVAL_MS = 10_000L
 private const val RSSI_POLL_INTERVAL_MS = 5_000L
 
 /**
@@ -51,7 +50,6 @@ class GpsTrackingService : Service() {
     private var gatt: CanonGattClient? = null
     private var bondedDevice: BluetoothDevice? = null
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
-    private var lastSentAt = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val rssiPollRunnable = object : Runnable {
@@ -229,7 +227,10 @@ class GpsTrackingService : Service() {
             Log.w(TAG, "ACCESS_FINE_LOCATION missing; cannot stream fixes")
             return
         }
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000L)
+        // Primary interval 10 s matcht Canon-Camera-Connect (`i4.n.java:552`).
+        // Fastest 5 s lässt Android uns Updates früher zustellen wenn eine
+        // andere App parallel GPS anfordert.
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10_000L)
             .setMinUpdateIntervalMillis(5000L)
             .build()
         fused.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
@@ -238,9 +239,6 @@ class GpsTrackingService : Service() {
     private fun onLocation(loc: Location) {
         val client = gatt ?: return
         if (client.gpsState != CanonGpsState.READY_TO_RECEIVE) return
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastSentAt < MIN_SEND_INTERVAL_MS) return
-        lastSentAt = now
 
         val nowSec = System.currentTimeMillis() / 1000L
         val ok = client.sendGps(
