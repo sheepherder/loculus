@@ -2,9 +2,7 @@ package de.schaefer.eosgps
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -18,7 +16,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,12 +26,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ElevatedCard
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -62,12 +56,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 
+// Camera advertises ~200 ms awake, ~3 s asleep. Eight seconds without a
+// single advertisement means the camera is gone (battery pulled, out of
+// range, or physically off beyond BLE standby). Used for the UI-side
+// staleness derivation when no GATT session is active.
+private const val AD_STALENESS_MS = 8_000L
+
 class MainActivity : ComponentActivity() {
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -82,6 +84,16 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        TrackingState.appVisible = true
+    }
+
+    override fun onPause() {
+        super.onPause()
+        TrackingState.appVisible = false
+    }
 }
 
 @SuppressLint("MissingPermission")
@@ -91,49 +103,64 @@ fun AppScreen() {
     var permsGranted by remember { mutableStateOf(hasAllPerms(ctx)) }
     var bondedCanon by remember { mutableStateOf<BluetoothDevice?>(null) }
 
-    val serviceRunning by TrackingState.serviceRunning.collectAsState()
     val connState by TrackingState.connState.collectAsState()
     val gpsState by TrackingState.gpsState.collectAsState()
     val fixCount by TrackingState.fixCount.collectAsState()
     val lastFix by TrackingState.lastFixText.collectAsState()
-    val cameraInfo by TrackingState.cameraInfo.collectAsState()
     val rssi by TrackingState.rssi.collectAsState()
     val cameraPower by TrackingState.cameraPower.collectAsState()
     val lastAdvertAt by TrackingState.lastAdvertAt.collectAsState()
     val sessionStart by TrackingState.sessionStartedAt.collectAsState()
     val lastFixAt by TrackingState.lastFixAt.collectAsState()
     val writeErrors by TrackingState.writeErrors.collectAsState()
-    val log by TrackingState.lastLog.collectAsState()
 
-    // Auto-start toggle state. Persisted in Prefs; UI state just mirrors it
-    // so the switch responds instantly and we sync Prefs on click.
-    var autoStartEnabled by remember { mutableStateOf(Prefs.autoStartEnabled(ctx)) }
+    // The single user switch. Persisted in Prefs; UI mirrors it so toggles
+    // feel instant and we sync Prefs + scanner side-effects on click.
+    var trackingEnabled by remember { mutableStateOf(Prefs.trackingEnabled(ctx)) }
     var batteryOptIgnored by remember { mutableStateOf(isBatteryOptIgnored(ctx)) }
     var backgroundLocationGranted by remember { mutableStateOf(hasBackgroundLocation(ctx)) }
 
-    // Re-read on every resume — the user might have just returned from
-    // the system Settings screen where they toggled battery optimization
-    // or granted background location.
+    // Activity-scoped scanner lifecycle.
+    //  ON_RESUME: unregister the OS-offloaded scan (our live scanner takes
+    //             over), start the live scanner. Re-read permission state —
+    //             user may have flipped something in Settings while we were
+    //             away.
+    //  ON_PAUSE:  stop the live scanner. If tracking is on and no GATT
+    //             session is active, arm the OS-offloaded scan so the system
+    //             wakes us on the next POWER_ON advertisement.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                batteryOptIgnored = isBatteryOptIgnored(ctx)
-                backgroundLocationGranted = hasBackgroundLocation(ctx)
-                autoStartEnabled = Prefs.autoStartEnabled(ctx)
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> {
+                    CanonScanRegistrar.unregister(ctx)
+                    FgScanner.start(ctx)
+                    batteryOptIgnored = isBatteryOptIgnored(ctx)
+                    backgroundLocationGranted = hasBackgroundLocation(ctx)
+                    trackingEnabled = Prefs.trackingEnabled(ctx)
+                }
+                Lifecycle.Event.ON_PAUSE -> {
+                    FgScanner.stop()
+                    if (Prefs.trackingEnabled(ctx) && !TrackingState.serviceRunning.value) {
+                        CanonScanRegistrar.register(ctx)
+                    }
+                }
+                else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Ticker so elapsed-time displays refresh once per second while a session
-    // runs. Cheap — only a handful of Text recompositions.
+    // 1 Hz ticker for "X ago" displays. Bound to STARTED so it pauses
+    // automatically while the Activity is in the background.
     var nowTick by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    LaunchedEffect(serviceRunning) {
-        while (serviceRunning) {
-            nowTick = SystemClock.elapsedRealtime()
-            delay(1000)
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                nowTick = SystemClock.elapsedRealtime()
+                delay(1000)
+            }
         }
     }
 
@@ -141,7 +168,12 @@ fun AppScreen() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         permsGranted = results.values.all { it }
-        if (permsGranted) bondedCanon = findBondedCanon(ctx)
+        if (permsGranted) {
+            bondedCanon = findBondedCanon(ctx)
+            // Permissions may have just been granted — kick the scanner so
+            // the first ads land immediately.
+            FgScanner.start(ctx)
+        }
     }
 
     // Background-location has to be asked for separately on Android 11+ —
@@ -171,18 +203,26 @@ fun AppScreen() {
 
         Spacer(Modifier.height(10.dp))
 
+        // Derive the displayed power state from advertisement freshness. If
+        // the camera went out of range / lost its battery, ads simply stop —
+        // the last remembered state (e.g. POWER_ON) is then meaningless. We
+        // don't keep a separate watchdog timer: nowTick already ticks once
+        // per second, so this recomputes on every tick for free.
+        //
+        // During a GATT session the camera deliberately stops advertising;
+        // trust the last known state instead of flipping to UNSEEN.
+        val effectivePower = when {
+            connState != ConnState.IDLE -> cameraPower
+            lastAdvertAt == null -> CameraPowerState.UNSEEN
+            nowTick - lastAdvertAt!! > AD_STALENESS_MS -> CameraPowerState.UNSEEN
+            else -> cameraPower
+        }
+
         InfoCard("Connection") {
             KeyValueRow("power") {
-                // Distinguish "scanner running but no ad heard" (unseen)
-                // from "not scanning at all" (—). Without this, the power
-                // row looks identical in both cases.
-                val scanning = serviceRunning || autoStartEnabled
-                val powerLabel =
-                    if (cameraPower == CameraPowerState.UNSEEN && !scanning) "—"
-                    else cameraPower.label()
-                StatusDot(color = powerStateColor(cameraPower))
+                StatusDot(color = powerStateColor(effectivePower))
                 Spacer(Modifier.width(6.dp))
-                MonoText(powerLabel)
+                MonoText(effectivePower.label())
                 // Camera stops advertising during a GATT session; hide the
                 // age then so it doesn't grow meaninglessly.
                 if (lastAdvertAt != null && connState == ConnState.IDLE) {
@@ -252,36 +292,46 @@ fun AppScreen() {
 
         Spacer(Modifier.height(8.dp))
 
-        InfoCard("Auto-Start") {
+        InfoCard("Tracking") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    MonoText(if (autoStartEnabled) "on" else "off", bold = true)
+                    MonoText(if (trackingEnabled) "on" else "off", bold = true)
                     Text(
-                        if (autoStartEnabled) "listening in background" else "manual start only",
+                        if (trackingEnabled)
+                            "verbindet & streamt GPS sobald die Kamera angeht"
+                        else
+                            "zeigt nur Ads, kein GPS-Transmit",
                         fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Switch(
-                    checked = autoStartEnabled,
+                    checked = trackingEnabled,
                     enabled = permsGranted && bondedCanon != null,
                     onCheckedChange = { want ->
-                        autoStartEnabled = want
-                        Prefs.setAutoStartEnabled(ctx, want)
-                        if (want) {
-                            val ok = CanonScanRegistrar.register(ctx)
-                            if (!ok) TrackingState.log("auto-start: scan registration failed")
-                        } else {
+                        trackingEnabled = want
+                        Prefs.setTrackingEnabled(ctx, want)
+                        if (!want) {
+                            // OFF: tear everything down. Defensive unregister
+                            // even if we think nothing is armed.
                             CanonScanRegistrar.unregister(ctx)
+                            if (TrackingState.serviceRunning.value) {
+                                GpsTrackingService.stop(ctx)
+                            }
                         }
+                        // ON: nothing to do here. Activity is visible (we're
+                        // in a click handler), FgScanner is already running,
+                        // and it will start the FGS on the next POWER_ON ad.
+                        // The OS-offloaded scan gets armed on our next
+                        // ON_PAUSE handoff.
                     },
                     colors = SwitchDefaults.colors(),
                 )
             }
-            if (autoStartEnabled && !batteryOptIgnored) {
+            if (trackingEnabled && !batteryOptIgnored) {
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "Akku-Optimierung ausschalten, sonst throttelt Android den Scan",
@@ -293,7 +343,7 @@ fun AppScreen() {
                     Text("Akku-Optimierung öffnen")
                 }
             }
-            if (autoStartEnabled && !backgroundLocationGranted) {
+            if (trackingEnabled && !backgroundLocationGranted) {
                 Spacer(Modifier.height(4.dp))
                 Text(
                     "Hintergrund-Ortung: ohne 'Immer zulassen' kommen Fixes nur wenn App offen ist",
@@ -314,50 +364,11 @@ fun AppScreen() {
         Spacer(Modifier.height(10.dp))
 
         if (!permsGranted) {
-            Button(onClick = { permLauncher.launch(allPerms()) }) {
-                Text("Grant permissions")
-            }
-            Spacer(Modifier.height(8.dp))
-        }
-
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
             Button(
-                onClick = { GpsTrackingService.start(ctx) },
-                enabled = permsGranted && bondedCanon != null && !serviceRunning,
-                modifier = Modifier.weight(1f),
-            ) { Text("Start") }
-            OutlinedButton(
-                onClick = { GpsTrackingService.stop(ctx) },
-                enabled = serviceRunning,
-                modifier = Modifier.weight(1f),
-            ) { Text("Stop") }
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        ElevatedCard(modifier = Modifier.fillMaxWidth().weight(1f)) {
-            Column(modifier = Modifier.padding(10.dp).fillMaxSize()) {
-                Text(
-                    "LOG",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
-                val scroll = rememberScrollState()
-                Column(
-                    modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(scroll)
-                ) {
-                    log.forEach { line ->
-                        Text(
-                            line, fontFamily = FontFamily.Monospace, fontSize = 10.sp,
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                    }
-                }
+                onClick = { permLauncher.launch(allPerms()) },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Grant permissions")
             }
         }
     }

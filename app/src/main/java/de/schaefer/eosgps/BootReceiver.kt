@@ -16,8 +16,8 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
         val action = intent.action ?: return
         Log.i(TAG, "onReceive action=$action")
-        if (!Prefs.autoStartEnabled(ctx)) {
-            Log.i(TAG, "auto-start disabled; no-op")
+        if (!Prefs.trackingEnabled(ctx)) {
+            Log.i(TAG, "tracking disabled; no-op")
             return
         }
         // Registration is cheap; always re-register on these events rather

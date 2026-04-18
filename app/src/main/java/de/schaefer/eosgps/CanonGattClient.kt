@@ -94,7 +94,6 @@ private sealed class GattOp {
 @SuppressLint("MissingPermission")
 class CanonGattClient(
     private val context: Context,
-    private val onLog: (String) -> Unit,
     private val onStateChange: (ConnState) -> Unit,
     private val onGpsState: (CanonGpsState) -> Unit,
     private val onRssi: (Int) -> Unit = {},
@@ -122,7 +121,6 @@ class CanonGattClient(
         private set(value) {
             field = value
             Log.i(TAG, "state -> $value")
-            onLog("state -> $value")
             onStateChange(value)
         }
 
@@ -130,13 +128,11 @@ class CanonGattClient(
         private set(value) {
             field = value
             Log.i(TAG, "gpsState -> $value")
-            onLog("gpsState -> $value")
             onGpsState(value)
         }
 
     private fun log(msg: String) {
         Log.i(TAG, msg)
-        onLog(msg)
     }
 
     // --- Public API ---

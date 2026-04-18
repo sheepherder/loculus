@@ -2,8 +2,8 @@ package de.schaefer.eosgps
 
 /**
  * Canon advertisement decoding — single source of truth for both the
- * OS-offloaded scan ([CanonScanRegistrar]) and the in-service scan
- * ([GpsTrackingService]).
+ * Activity-owned live scan ([FgScanner]) and the OS-offloaded scan
+ * ([CanonScanRegistrar]).
  *
  * The Canon-specific payload under company id `0x01A9` is 6 bytes. We only
  * interpret byte 5 bits 1-2 (the power-state enum, decoded per the

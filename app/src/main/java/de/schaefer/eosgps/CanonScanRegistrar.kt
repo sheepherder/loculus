@@ -2,7 +2,6 @@ package de.schaefer.eosgps
 
 import android.annotation.SuppressLint
 import android.app.PendingIntent
-import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -26,18 +25,8 @@ object CanonScanRegistrar {
 
     @SuppressLint("MissingPermission")
     fun register(ctx: Context): Boolean {
-        if (!hasBluetoothPermissions(ctx)) {
-            Log.w(TAG, "register: missing BLUETOOTH_SCAN/CONNECT permission")
-            return false
-        }
-        val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val adapter = mgr?.adapter
-        if (adapter == null || !adapter.isEnabled) {
-            Log.w(TAG, "register: bluetooth adapter unavailable or disabled")
-            return false
-        }
-        val scanner = adapter.bluetoothLeScanner ?: run {
-            Log.w(TAG, "register: bluetoothLeScanner null")
+        val scanner = readyScanner(ctx) ?: run {
+            Log.w(TAG, "register: scanner preflight failed")
             return false
         }
         val target = findBondedCanon(ctx) ?: run {
@@ -80,15 +69,12 @@ object CanonScanRegistrar {
 
     @SuppressLint("MissingPermission")
     fun unregister(ctx: Context) {
-        val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val scanner = mgr?.adapter?.bluetoothLeScanner
-        if (scanner != null && hasBluetoothPermissions(ctx)) {
-            try {
-                scanner.stopScan(buildPendingIntent(ctx))
-                Log.i(TAG, "unregister: scan disarmed")
-            } catch (e: Exception) {
-                Log.w(TAG, "unregister: ${e.message}")
-            }
+        val scanner = readyScanner(ctx) ?: return
+        try {
+            scanner.stopScan(buildPendingIntent(ctx))
+            Log.i(TAG, "unregister: scan disarmed")
+        } catch (e: Exception) {
+            Log.w(TAG, "unregister: ${e.message}")
         }
     }
 

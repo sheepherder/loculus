@@ -35,8 +35,15 @@ class ScanResultReceiver : BroadcastReceiver() {
         } ?: emptyList()
 
         if (results.isEmpty()) return
+        // A PendingIntent that was already queued by the BT stack can still
+        // be delivered after the user toggled tracking off (and we called
+        // stopScan). Drop it so we never connect against the user's intent.
+        if (!Prefs.trackingEnabled(ctx)) {
+            Log.i(TAG, "tracking disabled — dropping late scan result")
+            return
+        }
         val first = results.first()
         Log.i(TAG, "awake ad from ${first.device?.address} rssi=${first.rssi} → waking service")
-        GpsTrackingService.startForAwakeAd(ctx)
+        GpsTrackingService.start(ctx)
     }
 }

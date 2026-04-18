@@ -2,14 +2,6 @@ package de.schaefer.eosgps
 
 import kotlinx.coroutines.flow.MutableStateFlow
 
-data class CameraInfo(
-    val manufacturer: String? = null,
-    val model: String? = null,
-    val firmware: String? = null,
-    val software: String? = null,
-    val serial: String? = null,
-)
-
 /**
  * Power state decoded from bits 1–2 of byte 5 of the Canon BLE advertisement
  * (manufacturer-specific data, company id 0x01A9). The three non-UNSEEN
@@ -31,20 +23,27 @@ fun CameraPowerState.label(): String = when (this) {
 }
 
 /**
- * Shared observable state between the tracking service and the UI.
- *
- * Simple singleton with StateFlow fields — no DI, no fancy repository. The
- * service writes, Compose reads via collectAsState.
+ * Shared observable state between the tracking service, the foreground
+ * scanner and the UI. Simple singleton with StateFlow fields — no DI, no
+ * repository. Writers: FGS + FgScanner. Reader: Compose UI via
+ * collectAsState.
  */
 object TrackingState {
+    /**
+     * True while the MainActivity is in `onResume..onPause`. Written by the
+     * Activity, read by [GpsTrackingService.onDestroy] to decide whether to
+     * re-arm [CanonScanRegistrar]. Plain `var` — all access happens on the
+     * main thread (both Activity lifecycle callbacks and the Service's
+     * lifecycle callbacks run there).
+     */
+    var appVisible: Boolean = false
+
     val serviceRunning = MutableStateFlow(false)
     val connState = MutableStateFlow(ConnState.IDLE)
     val gpsState = MutableStateFlow(CanonGpsState.UNKNOWN)
     val lastFixText = MutableStateFlow<String?>(null)
     val fixCount = MutableStateFlow(0)
-    val lastLog = MutableStateFlow<List<String>>(emptyList())
 
-    val cameraInfo = MutableStateFlow(CameraInfo())
     val rssi = MutableStateFlow<Int?>(null)
     val cameraPower = MutableStateFlow(CameraPowerState.UNSEEN)
     val lastAdvertAt = MutableStateFlow<Long?>(null)
@@ -53,11 +52,6 @@ object TrackingState {
     val lastFixAt = MutableStateFlow<Long?>(null)  // elapsedRealtime() of last successful write
     val writeErrors = MutableStateFlow(0)
 
-    fun log(line: String) {
-        val cur = lastLog.value
-        lastLog.value = (listOf(line) + cur).take(200)
-    }
-
     fun resetSession() {
         fixCount.value = 0
         lastFixText.value = null
@@ -65,8 +59,5 @@ object TrackingState {
         lastFixAt.value = null
         rssi.value = null
         writeErrors.value = 0
-        cameraInfo.value = CameraInfo()
-        cameraPower.value = CameraPowerState.UNSEEN
-        lastAdvertAt.value = null
     }
 }
