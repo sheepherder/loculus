@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Android-App produktiv. Zwei-stufige Scan-Architektur: OS-offloaded PendingIntent-Scan im Idle-Modus (kein Foreground-Service nötig, <0,5 %/Tag Batterie), direkter ScanCallback nur während aktiver Session und 30s Reconnect-Grace. Auto-Start nach Boot und App-Update. Auto-Reconnect bei Kamera-Einschalten / Rückkehr in Reichweite, keine Sensor-Weckgeräusche bei schlafender Kamera. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
+**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`): wenn an, läuft die App passiv und streamt GPS, sobald die Kamera sich einschaltet. Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
 
-**Datum:** 2026-04-17
+**Datum:** 2026-04-18
 
 ---
 
@@ -248,79 +248,87 @@ pip install bleak
 
 ### Android-App (`android/`)
 
-Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon. **Scan-First-Architektur** — der Foreground Service scannt passiv auf Canon-Advertisements und connected nur wenn das Power-State-Byte awake meldet.
+Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon. **Ein-Schalter-Architektur** (`trackingEnabled`) mit strikter Scanner-Ownership: zu jedem Zeitpunkt höchstens ein aktiver Scan-Owner, der FGS existiert ausschließlich während einer GATT-Session.
 
-**Status (2026-04-17):**
-- OS-offloaded PendingIntent-Scan für Idle-Detection (byte5 low-3-bits gefiltert im HW): ✅
-- Interner ScanCallback nur während aktiver Session + 30s Reconnect-Grace (HW-Filter auf Company-ID): ✅
-- Auto-Start nach Boot, Package-Update, und App-Update: ✅
+**Status (2026-04-18):**
+- Ein User-Schalter "Tracking on/off" (Prefs `trackingEnabled`, Migration aus altem `auto_start_enabled`): ✅
+- Activity-owned Live-Scanner (`FgScanner`) bei sichtbarer Activity, HW-Filter Canon-Company-ID: ✅
+- OS-offloaded PendingIntent-Scan (`CanonScanRegistrar`) bei unsichtbarer Activity + Schalter on, HW-Filter zusätzlich byte5-low3=010 (awake): ✅
+- Foreground Service (`GpsTrackingService`) nur während GATT-Session (connect → stream → disconnect → exit), keine eigenen Scanner mehr: ✅
+- Hard-Gate auf `trackingEnabled` in FGS-start und `ScanResultReceiver` (gegen in-flight PendingIntents nach Schalter-OFF): ✅
+- Auto-Start nach Boot, Package-Update, App-Update via `BootReceiver`: ✅
 - Power-State aus Advertisement parsen (Byte 5 unter Company-ID `0x01A9`, low-3-bit-Logik): ✅
-- Auto-Connect bei Awake-Advertisement: ✅
 - Canon-Kickoff-Sequenz (8 CCCDs + `0x0a`-Handover + Source-Query + `0x01`-Pairing): ✅
 - BT-Icon auf Kamera leuchtet blau (durch Pairing-`01`-Write): ✅
 - Initial-NOTIFY-Fallback für bereits-ready-Kameras: ✅
 - GPS-Frame-Write (20 Byte binary LE, WRITE_NO_RESPONSE): ✅
 - Graceful Stop mit `{3}` + Disconnect: ✅
 - FusedLocationProvider Auto-Loop (10s-Rate), funktioniert auch bei geschlossener Activity durch FGS-Typ `location|connectedDevice` + `ACCESS_BACKGROUND_LOCATION` Exemption: ✅
-- Auto-Reconnect bei Kamera-Einschalten / Out-of-Range / Battery-Pull-Recovery: ✅
-- Re-Arm des OS-Scans beim Handoff (Edge-State-Reset): ✅
-- 2-Min-Hard-Cap auf internen Scan (gegen Android-30-Min-Throttling): ✅
-- Advertisement-Staleness-Watchdog → `UNSEEN` nach 8s Funkstille: ✅
-- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Auto-Start-Toggle, Battery-Opt- und Background-Location-Prompts: ✅
+- 20-min Scanner-Restart im Vordergrund (gegen Android's stille 30-min-`OPPORTUNISTIC`-Drosselung): ✅
+- UI-seitige Ad-Staleness-Derivation (> 8 s ohne Ad + `connState=IDLE` → `UNSEEN`), kein Watchdog-Timer: ✅
+- OS-Scan-Rearm (`unregister`+`register`) bei FGS-Teardown wenn Activity unsichtbar: ✅
+- Lifecycle-gebundener Compose-Ticker (`repeatOnLifecycle(STARTED)`), kein Dauer-Wake im Hintergrund: ✅
+- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Tracking-Switch, Battery-Opt- und Background-Location-Prompts: ✅
 - EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert: ✅
 
 **Architekturübersicht:**
 
 ```
-┌──────────── IDLE (App-Prozess schläft) ─────────────────────┐
-│                                                             │
-│   BootReceiver ─► CanonScanRegistrar.register(ctx)         │
-│                             │                               │
-│                             ▼                               │
-│   BluetoothLeScanner.startScan(filter, pendingIntent)       │
-│   HW-Filter: Canon mfg id 0x01A9 + byte5 low3 = 010         │
-│   Läuft im System-Prozess, kein FGS nötig, kein 30min-Limit │
-│                             │                               │
-│   ─── Kamera geht an → erste awake-Ad ───                   │
-│                             │                               │
-│                             ▼                               │
-│   ScanResultReceiver.onReceive()                            │
-│   Verifiziert MAC im Code, startForAwakeAd()                │
-└─────────────────────────────────────────────────────────────┘
+                       ┌─────────────┐
+                       │  trackingEnabled  ◂── ein User-Schalter
+                       └──────┬──────┘
                               │
-                              ▼
-┌──────── AKTIV (GpsTrackingService FGS) ────────────────────┐
-│                                                             │
-│   startTracking(awakeHint=true)                             │
-│   FGS-Typ: connectedDevice + (location wenn BG-Perm)        │
-│   Interner BluetoothLeScanner (HW-Filter: Canon mfg id)     │
-│   2-Min-Hard-Cap gegen Android-30-Min-Drosselung            │
-│                             │                               │
-│                             ▼                               │
-│   handleAdvertisement() — MAC + byte5 → AWAKE state         │
-│                             │                               │
-│                             ▼                               │
-│   CanonGattClient ── state machine ──► GPS_SESSION_ACTIVE   │
-│                             │                               │
-│                             ▼                               │
-│   FusedLocation → sendGps(20B Frame, NO_RESPONSE)           │
-│                                                             │
-│   onGattDisconnected() → interner Scan (30s Reconnect-Grace)│
-│     └─ Kamera kehrt zurück: sofortiger Reconnect            │
-│     └─ Timeout: unregister + register (Edge-Reset) → exit   │
-│                                                             │
-│   staleness watchdog ──► UNSEEN nach 8s ohne Ad             │
-└─────────────────────────────────────────────────────────────┘
+          Activity sichtbar? ─┴─ nein ──┐
+                 │                      │
+              (ja)                      ▼
+                 │            CanonScanRegistrar (OS-offloaded)
+                 ▼            HW-Filter: MAC + 0x01A9 + byte5 awake
+           FgScanner          PendingIntent → ScanResultReceiver
+           HW-Filter:              │
+           MAC + 0x01A9            │
+                 │                 │
+                 │   POWER_ON-Ad   │
+                 └──────┬──────────┘
+                        ▼
+                ┌────────────────┐
+                │ GpsTrackingSvc │  (FGS, nur während GATT-Session)
+                │ connectedDevice│
+                │ + location*    │  *wenn BG-Location granted
+                └────────┬───────┘
+                         │
+                         ▼
+          CanonGattClient ── state machine ──► GPS_SESSION_ACTIVE
+                         │
+                         ▼
+          FusedLocation → sendGps(20B LE, NO_RESPONSE)  @10s
+                         │
+                         ▼ GATT disconnect (standby / out of range / battery pull)
+          FGS.onDestroy:
+              └─ wenn trackingEnabled && !TrackingState.appVisible
+                    → CanonScanRegistrar.rearm(ctx)   (unreg+reg, Edge-Reset)
+              └─ sonst: Activity-Scanner sieht nächste Ad
 ```
+
+**Lifecycle-Handoffs:**
+
+| Trigger | Aktion |
+|---------|--------|
+| Activity `onResume` | `CanonScanRegistrar.unregister` → `FgScanner.start`, `TrackingState.appVisible=true` |
+| Activity `onPause` | `FgScanner.stop` → wenn `trackingEnabled && !serviceRunning` → `CanonScanRegistrar.register`, `appVisible=false` |
+| Schalter ON | `Prefs.setTrackingEnabled(true)`. Activity-Scanner läuft bereits (wir sind im Click-Handler), OS-Scan kommt beim nächsten `onPause`. |
+| Schalter OFF | `Prefs.setTrackingEnabled(false)` → `CanonScanRegistrar.unregister` → falls FGS läuft `GpsTrackingService.stop` |
+| Activity-Scanner sieht POWER_ON | wenn `trackingEnabled && !serviceRunning` → `GpsTrackingService.start` |
+| `ScanResultReceiver` (OS-Scan-Match) | wenn `trackingEnabled` → `GpsTrackingService.start`, sonst drop (late PendingIntent) |
+| `FGS.onDestroy` | wenn `trackingEnabled && !appVisible` → `CanonScanRegistrar.rearm` |
 
 **Filter-Matrix:**
 
-|                    | HW-Filter                              | Code-Filter         |
-|--------------------|----------------------------------------|---------------------|
-| Idle (OS-Scan)     | MAC + Canon mfg id + byte5 low3 awake  | —                   |
-| Aktiv (intern)     | MAC + Canon mfg id                     | byte5 → State       |
+|                  | HW-Filter                                   | Code-Filter           |
+|------------------|---------------------------------------------|-----------------------|
+| OS-Scan (BG)     | MAC + Canon mfg id `0x01A9` + byte5 awake   | —                     |
+| FgScanner (FG)   | MAC + Canon mfg id `0x01A9`                 | byte5 → Power-State   |
 
-Idle-Stage bekommt nur Awake-Ads der eigenen Kamera, Service wird nur für echte Wake-Events aufgeweckt. Aktiver Stage sieht beide Power-States (awake/asleep) für UI und Staleness-Watchdog. Konstanten gemeinsam in `CanonAd.kt`. Die MAC-Filterung findet in beiden Pfaden in Hardware statt — `ScanFilter.setDeviceAddress(String)` funktioniert für Canons public MAC sauber, der ältere Phase-6-Verdacht dass die 1-arg-Variante silently suppress hätte, war ein Aberglaube.
+OS-Scan-Stage wird nur auf echte Wake-Events aufgeweckt; der PendingIntent-Broadcast liefert ohnehin einen verschlankten `ScanResult` (oft `rssi=0`, `scanRecord=null`), dem HW-Filter wird vertraut. FgScanner sieht alle Power-States live — das Decoding findet in `CanonAd.powerStateFromByte()` statt (single source of truth in `CanonAd.kt`). Preflight-Duplikat (Permission + Adapter + Scanner-Resolution) wurde in `Bluetooth.readyScanner()` extrahiert.
 
 **Build/Install:**
 ```bash
@@ -335,16 +343,18 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 ```
 android/app/src/main/java/de/schaefer/eosgps/
-├── MainActivity.kt         Compose UI, Permission-Flow, Auto-Start-Toggle
-├── GpsTrackingService.kt   Foreground Service, State-Machine
-├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff
-├── CanonGpsFrame.kt        20-Byte-Binär-Encoder
-├── CanonAd.kt              Scan-Konstanten + powerStateFromByte()
-├── CanonScanRegistrar.kt   OS-Scan-Registration mit HW-Filter + PendingIntent
-├── ScanResultReceiver.kt   Broadcast-Receiver für HW-Filter-Matches
-├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm
-├── Prefs.kt                SharedPreferences-Wrapper (autoStart, scanRegistered)
-└── TrackingState.kt        StateFlows (Service ↔ UI)
+├── MainActivity.kt         Compose UI, Lifecycle-gebundener Scanner + Ticker, Tracking-Switch
+├── GpsTrackingService.kt   FGS nur während GATT-Session (~270 Zeilen, kein Scan, keine Watchdogs)
+├── FgScanner.kt            Activity-owned Live-Scanner, 20-min Restart, HW-Filter MAC+CompanyID
+├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff (unverändert)
+├── CanonGpsFrame.kt        20-Byte-Binär-Encoder (unverändert)
+├── CanonAd.kt              Scan-Konstanten + powerStateFromByte() (single source of truth)
+├── CanonScanRegistrar.kt   OS-Scan via PendingIntent, HW-Filter inkl. byte5-awake
+├── ScanResultReceiver.kt   Broadcast-Receiver mit Prefs-Hard-Gate
+├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm wenn trackingEnabled
+├── Bluetooth.kt            findBondedCanon + readyScanner + hasBluetoothPermissions + hasBackgroundLocation
+├── Prefs.kt                SharedPreferences mit Migration autoStartEnabled → trackingEnabled
+└── TrackingState.kt        StateFlows + `appVisible: Boolean` (Service ↔ UI)
 ```
 
 **Bewusst nicht implementiert / offene TODOs:**
@@ -435,4 +445,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-04-17*
+*Letzte Aktualisierung: 2026-04-18*

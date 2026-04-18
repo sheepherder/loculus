@@ -443,6 +443,80 @@ App ist jetzt wirklich Alltag-fertig:
 
 Die Phase-7-Lessons sind unten im erweiterten Lessons-Learned-Abschnitt dokumentiert.
 
+## Phase 8 — Vereinfachung auf einen Schalter (April 2026)
+
+Nach Phase 7 war die App zwar alltagstauglich, aber intern schleppte sie Mechanik mit, die im Rückblick eindeutig über das Ziel hinausschoss. User-Feedback nach ein paar Tagen Nutzung: *„zu viele Timer und Systeme. Ich will nur einen Schalter."*
+
+### Bestandsaufnahme dessen was zu viel war
+
+Drei Scanner-ähnliche Kontexte liefen parallel:
+
+1. `CanonScanRegistrar` — OS-offloaded PendingIntent-Scan
+2. `GpsTrackingService` interner `ScanCallback` — während aktiver Session + 30s Reconnect-Grace + 2min Hardcap
+3. Staleness-Watchdog — Handler-Runnable alle 2s, kippt `cameraPower` auf `UNSEEN` nach 8s
+
+Vier Timeouts mit unterschiedlichen Semantiken: `AD_STALENESS_THRESHOLD_MS=8s`, `STALENESS_CHECK_INTERVAL_MS=2s`, `RECONNECT_GRACE_MS=30s`, `INTERNAL_SCAN_MAX_MS=2min`. Drei Handoff-Pfade zwischen Service und OS-Scan: `scanTimeout` (nach 2min), `reconnectGiveup` (nach 30s), `awakeHint` als Intent-Extra für den Fast-Path-Start.
+
+Dazu die UI: Start/Stop-Buttons plus Auto-Start-Toggle, also zwei User-Controls für denselben semantischen Zustand. Ein scrollender Log-Panel unten, der primär der Bring-up-Phase diente und sich danach als Clutter entpuppte.
+
+### Das Zielmodell
+
+*Ein* User-Schalter `trackingEnabled`. *Ein* Scanner-Owner zu jedem Zeitpunkt, klar an eine Android-Lebenszeit gebunden:
+
+- **Activity sichtbar** → `FgScanner` (Activity-owned object) läuft. Zeigt alle Power-States live. Triggert FGS bei `POWER_ON` wenn Schalter on.
+- **Activity unsichtbar + Schalter on** → `CanonScanRegistrar` (OS-offloaded) ist armed. System weckt den FGS über `ScanResultReceiver`.
+- **Schalter off, alles egal** → nichts läuft passiv.
+
+Der FGS wird aus einem Dauer-Scanner-Hoster zu einem reinen GATT-Session-Owner: start → connect → stream → disconnect → exit. Keine eigene Scan-Logik mehr.
+
+### Entscheidungen mit User im Interview
+
+Vor dem Umbau wurden die heiklen Punkte explizit abgestimmt:
+
+- **FGS-Scope?** → nur während GATT-Session. *Nicht* Dauer-FGS bei Schalter on (keine Dauer-Notification).
+- **Schalter off + App offen?** → Scanner läuft trotzdem, zeigt Ads. Nur GPS-Transmit bleibt aus.
+- **GATT-Disconnect während Session?** → sofort exit, kein Grace-Fenster. Reconnect nur über ad-getriggerten frischen Start. „Codemässig am klarsten" (User).
+- **Activity-Lifecycle?** → zunächst `onStart/onStop` vorgeschlagen; User hat mich korrigiert auf `onResume/onPause`. Begründung: „Live-Scanner soll nicht versehentlich lange leben wenn er nicht sichtbar ist, er braucht mehr Batterie und kann ggf. undetektiert gedrosselt werden."
+- **Prefs-Key?** → Rename `autoStartEnabled → trackingEnabled` mit einmaliger Migration im Getter. Bestehende Installs verlieren ihren Opt-in nicht.
+- **Log-Panel?** → weg. Debug-Info nur noch via `adb logcat`.
+- **Debug-UI-Felder (RSSI, Fix-Rate, Write-Errors, Ad-Freshness)?** → vorerst beibehalten für die Verifikationsphase. UI-Polish-Pass kommt später, wenn die Architektur in Praxis solide läuft.
+- **Scan-Restart-Intervall?** → 20 min, gegen Android's 30-min-Drosselung. Throttling ist nicht detektierbar (kein Callback, keine API).
+
+### Umsetzung
+
+`GpsTrackingService` schrumpfte von 525 auf 271 Zeilen. Weg: `ScanCallback`, `BluetoothLeScanner`-Feld, `scanning`-Flag, `handleAdvertisement`, `markContact`, `markAdvertisement`, `staleWatchdog` + `watchdogAnchorMs`, `scanTimeout` + `INTERNAL_SCAN_MAX_MS`, `reconnectGiveup` + `RECONNECT_GRACE_MS`, `AD_STALENESS_THRESHOLD_MS` + `STALENESS_CHECK_INTERVAL_MS`, `EXTRA_AWAKE_AD_HINT` + `startForAwakeAd`. Was blieb: `startForeground` mit richtigem FGS-Typ, `FusedLocationProvider`-Loop, RSSI-Poll (Debug), `CanonGattClient`-Anbindung, Notification-Updates.
+
+Neu: `FgScanner.kt` als `object` mit `start(ctx)`/`stop()`, HW-Filter `MAC + 0x01A9` (keine byte5-Einschränkung weil UI alle Power-States zeigen soll), 20-min Handler-Restart. Bei `POWER_ON && trackingEnabled && !serviceRunning` → `GpsTrackingService.start(ctx)`.
+
+`MainActivity` bekam ein `DisposableEffect` mit `LifecycleEventObserver`, das bei `ON_RESUME` den OS-Scan abmeldet + `FgScanner` startet, bei `ON_PAUSE` umgekehrt. Start/Stop-Buttons weg. Log-Panel weg. Ein Switch in einer einzigen Card mit zwei Zustandslabels („on / verbindet & streamt GPS sobald die Kamera angeht" vs. „off / zeigt nur Ads, kein GPS-Transmit"). Die Akku-Opt- und Background-Location-Prompts wurden beibehalten.
+
+Ad-Staleness wird ab jetzt **in der UI** aus `TrackingState.lastAdvertAt` abgeleitet (`effectivePower` im Compose-Scope): wenn `connState == IDLE` und seit >8s keine Ad, zeige `UNSEEN`. Der 1-Hz-Ticker recomposed eh pro Sekunde, die Derivation kostet nichts. Kein separater Watchdog-Timer mehr.
+
+`CanonGattClient` verlor den `onLog: (String) -> Unit`-Callback, der nur zum UI-Log beitrug — alle Log-Zeilen gehen weiter durch `Log.i(TAG, …)`, sind also in `adb logcat` unverändert sichtbar.
+
+### Der Bug, den die Vereinfachung schuf, und der Fix in der UI
+
+Sobald die erste Version lief, sofort User-Feedback: *„wenn die Kamera Battery-Pull oder Out-of-Range geht, zeigt die App immer noch 'power on' an."*
+
+Stimmt. Der alte Staleness-Watchdog hatte `cameraPower` aktiv auf `UNSEEN` gekippt — ohne ihn bleibt der letzte Wert ewig stehen. Plan-konforme Lösung: UI-seitige Derivation mit `effectivePower`, Konstante `AD_STALENESS_MS = 8_000L`, recompute über den 1-Sekunden-Ticker. Kein neuer Timer, keine neue State. Acht Zeilen Code.
+
+### Review-Runde mit parallelen Agenten
+
+Nach dem ersten Durchlauf wurde der Diff an vier unabhängige Review-Instanzen gereicht — drei Claude-Subagenten (Code-Reuse / Quality / Efficiency) und Codex via MCP, mit YAGNI/DRY/SOLID/KISS-Brille. Ergebnis:
+
+- **Hard-Gate fehlte** (Codex): Ein OS-offloaded PendingIntent, der schon unterwegs ist wenn der User Schalter-off drückt, kann den FGS trotzdem starten. Fix: `Prefs.trackingEnabled`-Check an beiden Entry-Points (`FGS.startTracking` und `ScanResultReceiver.onReceive`), nicht als Code-Smell sondern als bewusstes Schutz-Gate.
+- **FgScanner.restartRunnable konnte doppelt posten** (Quality, Confidence 82): `onScanFailed` setzt `running=false` ohne das pending restart zu canceln. Wenn `start()` danach erneut läuft (z.B. aus dem Permission-Launcher-Callback), würden zwei 20-min-Loops parallel fahren. Fix: `removeCallbacks(restartRunnable)` in `start()` *vor* `postDelayed`.
+- **Compose-Ticker lief forever** (Efficiency + Codex): `LaunchedEffect(Unit) { while(true) ... }` ist an die Composition gebunden, nicht an den Activity-Lifecycle. Im Hintergrund tickt er weiter solange die Composition lebt. Fix: `lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) { while(true) ... }`.
+- **Leaky `MainActivity.isVisible`** (Codex + Quality): Der Service las ein statisches `@Volatile`-Flag direkt aus der Activity-Klasse. Cleaner in `TrackingState.appVisible` verschoben; `@Volatile` entfiel (Zugriff ist main-thread-only in beiden Richtungen).
+- **DRY: Preflight-Duplikat** (Reuse + Codex Nit): `FgScanner` und `CanonScanRegistrar` wiederholten je ~6 Zeilen `hasPerm → BluetoothManager → adapter.isEnabled → adapter.bluetoothLeScanner`. In `Bluetooth.readyScanner(ctx): BluetoothLeScanner?` extrahiert — Callsites schrumpfen auf eine Zeile.
+- **Dead code** (Codex Nit): unused `Arrangement`-Import, unused `val serviceRunning by collectAsState()` in `MainActivity`, veraltete `CanonAd.kt`-Klassendoku die noch den abgeschafften „in-service scan" erwähnt. Alle gefixt.
+
+Bewusst übersprungen: RSSI-Poll streichen (User-Entscheidung: Debug bleibt), ScanFilter-Builder extrahieren (zwei Call-Sites, fundamental unterschiedliche Filter-Semantik — awake-only vs. all-states), Notification-PendingIntent-Cache (6 Rebuild/min sind vernachlässigbar), `stopTracking`-cameraPower-Reset (die 8-s-Staleness deckt das ab).
+
+### Stand nach Phase 8
+
+Die App bleibt funktional identisch zu Phase 7: Boot-Auto-Start, Auto-Connect bei Kamera-Einschalten, EXIF-Output-Identität mit der Canon-App, <0,5 %/Tag Batterie im Leerlauf. *Was sich geändert hat ist die Innenseite* — 417 Zeilen weg, 225 dazu (netto −192), klare Ownership-Regeln, ein Switch, eine Staleness-Quelle, ein Lifecycle-bound Ticker.
+
 ## Nachbetrachtung — was wir rückblickend hätten wissen können
 
 Nach Abschluss von Phase 6 haben wir die Literaturrecherche gemacht die wir vor Projektstart hätten machen sollen. Ergebnisse, geordnet nach Überlappung mit unserem Projekt:
@@ -520,3 +594,9 @@ Wäre ein dankbarer PR an `gkoh/furble` um dort die Canon-Scan-Robustheit mit de
 - **Scan-Callback-Varianten haben unterschiedliche Haltbarkeit.** Direkte `ScanCallback`s werden nach ~30 Minuten auf `SCAN_MODE_OPPORTUNISTIC` gedrosselt. PendingIntent-basierte nicht. Wenn der interne Scan in einer App länger als wenige Minuten laufen darf, in Richtung stummer Nicht-Funktion. Immer Hard-Timeout setzen und zurück auf PendingIntent-Pfad handen.
 - **PendingIntent-Scan liefert reduzierte ScanResults.** Im Broadcast sind `rssi`, `scanRecord.bytes`, `getManufacturerSpecificData()` oft alle null oder leer — nur `device.address` ist verlässlich da. Wer auf detaillierte Payload-Daten im Receiver angewiesen ist, hat ein Problem. Dem HW-Filter vertrauen oder auf direkten `ScanCallback` umsteigen.
 - **Bash-Pipes schlucken Exit-Codes.** `gradle | tail && adb install` läuft auch bei BUILD FAILED weiter, weil `tail` immer 0 zurückgibt, wenn es lesen konnte. Ergebnis: alter APK bleibt auf dem Gerät, Änderungen scheinen nicht zu greifen, Debug-Runde für Nichts. Entweder `set -o pipefail` oder `gradle > /tmp/x.log 2>&1 && adb install …; tail /tmp/x.log` — Exit-Code muss direkt vom Builder kommen.
+- **Timer sind der Default-Ausweg aus Ownership-Unklarheit.** Phase-7-Architektur hatte drei Timer (`AD_STALENESS`, `RECONNECT_GRACE`, `INTERNAL_SCAN_MAX`), weil jeweils eine Zuständigkeits-Frage nicht sauber beantwortet war — „wer merkt dass die Ad fehlt", „wer wacht darüber ob reconnect klappt", „wer verhindert Drosselung". Sobald *ein* Owner pro Lifecycle-Phase festgelegt ist (Activity-Scanner vs. OS-Scan vs. FGS-GATT-only), werden die Timer redundant: der jeweilige Owner sieht das Event oder er sieht es nicht, kein Drittsystem muss mitkontrollieren. **Leitsatz:** jeder Timer im Code ist eine Frage „wer ist hier zuständig" die noch nicht entschieden war.
+- **UI-Derivation statt Hintergrund-Watchdog.** Ad-Staleness als `UNSEEN`-Zustand war in Phase 7 ein 2s-Handler-Runnable, der `TrackingState.cameraPower` kippte. In Phase 8 ist es eine `when`-Klausel im Compose-Scope, die `effectivePower` aus `cameraPower` + `lastAdvertAt` + `connState` + `nowTick` ableitet. Die UI tickt eh pro Sekunde. Vorteile: kein lebender Timer wenn UI nicht sichtbar, kein State zum synchron halten, kein Race zwischen „Timer kippt Power" und „neue Ad setzt Power zurück". **Prinzip:** derive in the UI was du aus primary state berechnen kannst, persistiere es nicht.
+- **`LaunchedEffect(Unit) { while(true) { ... delay(X) } }` ist nicht lifecycle-scoped.** Die Composition hält den Job am Leben auch wenn die Activity in `onPause` ist — nur `onDestroyCompose` (faktisch selten) beendet ihn. Für echte Lifecycle-Bindung: `LaunchedEffect(lifecycleOwner) { lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) { while(true) { ... delay(X) } } }`. Vor allem relevant für endlose Ticker oder Poll-Loops — ein vergessener Wake-up pro Sekunde im Hintergrund ist auf Mobile messbar.
+- **Verschiedene Contexte fürs selbe „wann bin ich sichtbar"-Flag.** Phase 8 hatte kurzzeitig `MainActivity.isVisible` als `@Volatile var` im Companion — der Service griff direkt in die Activity-Klasse. Sauberer: ein geteiltes Flag im State-Holder (`TrackingState.appVisible`). Allgemeiner: **wenn ein Service sich für den UI-Lebenszyklus interessiert, gehört die Kopplung über ein shared state object, nicht über direkten Klassen-Zugriff.** Das vermeidet zirkuläre Abhängigkeiten und macht Testing trivial.
+- **Hard-Gates gegen in-flight asynchrone Trigger.** Ein `PendingIntent` der beim BT-Stack schon in der Queue liegt, wird auch dann noch zugestellt wenn dein Code ihn „abgemeldet" hat. Gleiches gilt für noch nicht konsumierte Intent-Broadcasts. **Jeder Entry-Point ins FGS** sollte den aktuellen Prefs-Zustand prüfen, nicht nur dem Aufrufer vertrauen — der Aufrufer könnte aus einer veralteten Welt kommen. Zwei Zeilen Defensive Code, verhindern sonst subtile „warum baut die App jetzt eine Session auf obwohl ich Tracking aus hatte"-Bugs.
+- **Parallele Review-Agenten finden andere Bugs als sequenzielle.** Vier unabhängige Reviews (drei Claude-Subagenten, einer Codex via MCP) fanden je *eigene* Probleme — der Reuse-Agent die DRY-Chancen, der Quality-Agent den `restartRunnable`-Double-Post, der Efficiency-Agent den Compose-Ticker-Leak, Codex das fehlende Hard-Gate und die leaky `isVisible`. Keiner davon hätte alleine alle fünf gefunden. **Refactor-Reviews sind embarrassingly parallel** — verschiedene Brillen lesen denselben Diff und priorisieren unterschiedlich. Kostet ein paar Dollar Tokens und spart einen Tag Bug-Hunt.
