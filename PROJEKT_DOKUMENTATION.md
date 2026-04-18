@@ -174,6 +174,35 @@ Encoder-Code: siehe `android/app/src/main/java/de/schaefer/eosgps/CanonGpsFrame.
 
 **Warum das wichtig ist:** Unsere frühen Versuche mit NMEA-Text-Frames (~140 Byte pro Update) haben die Kamera-Firmware mehrfach gecrashed — die Bytes nach dem `0x04`-Kommando wurden vom Parser als binärer Payload interpretiert, und die falschen Werte brachten die GPS-State-Machine in einen Zustand, aus dem sie nicht mehr rauskam (Busy-Lock, Reboot). Siehe `ENTWICKLUNGSVERLAUF.md` für die Story.
 
+### Remote-Shutter-Protokoll (`00030030`)
+
+Canon-App's „Bluetooth-Fernbedienung" schreibt im Smart-Pairing auf Characteristic `00030030` (Service `0x0003`) mit **WRITE_TYPE_DEFAULT** (acked). Im HCI-Snoop gegen Canon Camera Connect gesehene Werte: immer 2 Byte, Byte 0 = `0x00`, Byte 1 kodiert die Aktion.
+
+**Empirisch bestätigt (nur dieser eine Code):**
+
+| Bytes | Wirkung |
+|-------|---------|
+| `00 01` + `00 02` direkt hintereinander | Wenn Autofokus scharfstellen konnte: Foto auf SD-Karte. Sonst passiert nichts. |
+
+**Im Canon-App-Dekompilat gefundene Byte→Label-Zuordnungen** (`d4.C0500A.E(int)` mit `Log.d`-Strings + Byte-Konstanten in `com.canon.eos.N.java`):
+
+| Bytes | Canon-Log-Label |
+|-------|-----------------|
+| `00 01` / `00 02` | `AF_REL_ON` / `AF_REL_OFF` |
+| `00 03` / `00 04` | `AF_ON` / `AF_OFF` |
+| `00 05` / `00 06` | `REL_ON` / `REL_OFF` |
+| `00 10` / `00 11` | `MOVIE_START` / `MOVIE_STOP` |
+| `00 20` / `00 21` | `ZOOM_TELE` / `ZOOM_TELE_STOP` |
+| `00 22` / `00 23` | `ZOOM_WIDE` / `ZOOM_WIDE_STOP` |
+
+Die Labels sind Canons eigene Benennungen aus dem App-Code. Ob die vom Namen suggerierte Kamera-Aktion tatsächlich bei diesem Byte-Wert passiert, haben wir **nur für AF_REL_ON/OFF** empirisch geprüft. Die anderen Codes sind ungetestet.
+
+**Canon-App sendet in Paaren:** der Snoop zeigt Byte-Pairs mit variablem Zeitabstand zwischen den beiden Writes (unser erster und zweiter Write bei `00 01` / `00 02` sind ~100 ms auseinander und ergeben ein Foto). Der App-Code-Pfad für die Code-Auswahl hängt an App-internem State (Canon-App hat einen UI-Toggle Photo/Video); wie der sich nach außen als BLE-Befehl abbildet, haben wir nicht untersucht.
+
+**Beobachtete Begleit-Notifications beim Shutter-Write:** bei fehlgeschlagener AF auf `00 01` / `00 02` kommen ~540 ms nach dem zweiten ACK zwei NOTIFYs — `00030002` (REMOTE_EVENTS) = `0313` und `00030031` (REMOTE_APERTURE) = `010101`. Bei erfolgreicher AF + Foto bisher keine NOTIFYs gesehen. Kleine Stichprobe.
+
+Quelle-Evidenz: HCI-Snoop in `/tmp/btsnoop2/btsnoop_hci.log` (18.04.2026), Dekompilat unter `apk/CameraConnect-decompiled/`. Implementierung: `CanonGattClient.triggerShutter()`.
+
 ### Pairing-Protokoll (Erst-Pairing)
 
 Canon verwendet ein proprietäres Pairing über GATT (nicht Standard Bluetooth Pairing). Für das **initiale** Pairing (vom User über die Canon-App gemacht):

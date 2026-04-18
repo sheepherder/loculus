@@ -82,6 +82,11 @@ class GpsTrackingService : Service() {
                 stopTracking()
                 return START_NOT_STICKY
             }
+            ACTION_SHUTTER -> {
+                val ok = gatt?.triggerShutter() ?: false
+                Log.i(TAG, "shutter trigger requested, accepted=$ok")
+                return START_NOT_STICKY
+            }
             else -> startTracking()
         }
         // NOT_STICKY — the offloaded scan (if tracking is on) re-wakes us on
@@ -298,6 +303,7 @@ class GpsTrackingService : Service() {
 
     companion object {
         const val ACTION_STOP = "de.schaefer.eosgps.STOP"
+        const val ACTION_SHUTTER = "de.schaefer.eosgps.SHUTTER"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, GpsTrackingService::class.java)
@@ -306,6 +312,11 @@ class GpsTrackingService : Service() {
 
         fun stop(ctx: Context) {
             val i = Intent(ctx, GpsTrackingService::class.java).setAction(ACTION_STOP)
+            ctx.startService(i)
+        }
+
+        fun triggerShutter(ctx: Context) {
+            val i = Intent(ctx, GpsTrackingService::class.java).setAction(ACTION_SHUTTER)
             ctx.startService(i)
         }
     }

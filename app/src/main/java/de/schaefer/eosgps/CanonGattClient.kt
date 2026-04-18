@@ -53,6 +53,18 @@ object CanonUuids {
     val REMOTE_EXPOSURE: UUID = UUID.fromString("00030021-0000-1000-0000-d8492fffa821")
     val REMOTE_APERTURE: UUID = UUID.fromString("00030031-0000-1000-0000-d8492fffa821")
 
+    // Remote-control write char. Canon-App-Dekompilat (`C0500A.E()` +
+    // `N.java`) listet diese 2-Byte-Werte mit Log-String-Labels — die
+    // Byte→Label-Zuordnung ist belegt, ob das Label tatsächlich dem
+    // Kamera-Verhalten entspricht ist aber je Code ungeprüft.
+    //
+    //   0x0001 / 0x0002 AF_REL_ON / AF_REL_OFF   ← empirisch: Foto bei AF-OK
+    //   0x0003 / 0x0004 AF_ON / AF_OFF           (ungetestet)
+    //   0x0005 / 0x0006 REL_ON / REL_OFF         (ungetestet)
+    //   0x0010 / 0x0011 MOVIE_START / MOVIE_STOP (ungetestet)
+    //   0x0020..0x0023  ZOOM_TELE/WIDE + _STOP   (ungetestet)
+    val REMOTE_SHUTTER: UUID = UUID.fromString("00030030-0000-1000-0000-d8492fffa821")
+
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 }
 
@@ -106,6 +118,7 @@ class CanonGattClient(
     private var pairingDataChar: BluetoothGattCharacteristic? = null
     private var handoverDataChar: BluetoothGattCharacteristic? = null
     private var handoverNotifyChar: BluetoothGattCharacteristic? = null
+    private var shutterChar: BluetoothGattCharacteristic? = null
 
     // First byte of the GPS_NOTIFY characteristic as seen on the initial read
     // right after service discovery. We use this as a "was camera recently
@@ -146,6 +159,23 @@ class CanonGattClient(
 
     /** Request a fresh RSSI reading from the connected GATT link. Result arrives via onRssi. */
     fun readRssi(): Boolean = gatt?.readRemoteRssi() ?: false
+
+    /**
+     * Löst ein Foto aus, wenn der Autofokus scharfstellen konnte. Schickt
+     * `00 01` gefolgt von `00 02` auf REMOTE_SHUTTER. Bei fehlgeschlagenem
+     * Autofokus passiert nichts.
+     */
+    fun triggerShutter(): Boolean {
+        val ch = shutterChar ?: return false
+        if (gpsState != CanonGpsState.READY_TO_RECEIVE) {
+            log("triggerShutter rejected, gpsState=$gpsState"); return false
+        }
+        enqueue(GattOp.Write(ch, byteArrayOf(0x00, 0x01), "AF_REL_ON",
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+        enqueue(GattOp.Write(ch, byteArrayOf(0x00, 0x02), "AF_REL_OFF",
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+        return true
+    }
 
     /**
      * Send a GPS fix to the camera. Uses WRITE_TYPE_NO_RESPONSE — Canon does this
@@ -275,6 +305,7 @@ class CanonGattClient(
                 if (gatt === g) gatt = null
                 statusChar = null; dataChar = null; notifyChar = null
                 pairingDataChar = null; handoverDataChar = null; handoverNotifyChar = null
+                shutterChar = null
                 initialNotifyByte = -1
                 gpsState = CanonGpsState.UNKNOWN
                 state = ConnState.IDLE
@@ -301,6 +332,8 @@ class CanonGattClient(
                 handoverDataChar = hs.getCharacteristic(CanonUuids.HANDOVER_DATA)
                 handoverNotifyChar = hs.getCharacteristic(CanonUuids.HANDOVER_NOTIFY)
             }
+            val remoteSvc = g.getService(CanonUuids.REMOTE_SERVICE)
+            shutterChar = remoteSvc?.getCharacteristic(CanonUuids.REMOTE_SHUTTER)
 
             state = ConnState.SUBSCRIBING
 
@@ -325,7 +358,7 @@ class CanonGattClient(
                 subscribe(g, it, "HANDOVER_NOTIFY",
                     BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
             }
-            g.getService(CanonUuids.REMOTE_SERVICE)?.let { rs ->
+            remoteSvc?.let { rs ->
                 listOf(
                     CanonUuids.REMOTE_STATUS to "REMOTE_STATUS",
                     CanonUuids.REMOTE_EVENTS to "REMOTE_EVENTS",

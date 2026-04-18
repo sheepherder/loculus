@@ -517,6 +517,89 @@ Bewusst übersprungen: RSSI-Poll streichen (User-Entscheidung: Debug bleibt), Sc
 
 Die App bleibt funktional identisch zu Phase 7: Boot-Auto-Start, Auto-Connect bei Kamera-Einschalten, EXIF-Output-Identität mit der Canon-App, <0,5 %/Tag Batterie im Leerlauf. *Was sich geändert hat ist die Innenseite* — 417 Zeilen weg, 225 dazu (netto −192), klare Ownership-Regeln, ein Switch, eine Staleness-Quelle, ein Lifecycle-bound Ticker.
 
+## Phase 9 — BLE-Feature-Exploration und Shutter-Auslöser (April 2026)
+
+Aus `IDEEN_FUER_SPAETER.md` war „BLE-Daten-Exploration + Feature-Ausbau" der nächste Punkt. Konkret stand die Frage im Raum welche der Canon-Characteristics im Smart-Pairing-Modus tatsächlich was tun, und ob sich ein Shutter-Write auf `00030030` (aus furble Issue #189 bekannt) in unsere GPS-Session einbauen lässt.
+
+### Phase A — passive Exploration (und Abbruch)
+
+Erster Schritt: neue READs auf `0001000b` (PAIRING_RESPONSE), `00020001` (HANDOVER_STATE), `00030001/11/21/31` (Remote-State-Chars) und `00010005` (PAIRING_REQUEST) während der Subscribe-Phase, plus best-effort NOTIFY-Subscribes auf `00020004/5/6`. Ziel: Initialwerte sehen und beobachten welche Chars Events pushen.
+
+Ergebnis der Reads (alle statisch zwischen Sessions):
+
+| Char | Wert |
+|------|------|
+| `00040001` STATUS | `03 13 00` |
+| `00040003` NOTIFY | `02 00` (ready-Byte der letzten Session) |
+| `00020001` HANDOVER_STATE | `7f 00 00 00` |
+| `00030001` REMOTE_STATUS | `01 01 01` |
+| `00030011` REMOTE_ZOOM | `01` |
+| `00030021` REMOTE_EXPOSURE | `3f 00 00 00` |
+| `00030031` REMOTE_APERTURE | `01 01 01` |
+| `00010005` PAIRING_REQUEST | `01` |
+| `0001000b` PAIRING_RESPONSE | `07 00 00 00` |
+
+Zusätzlicher Fund: nach dem Handover-`0x0a`-Write pusht die Kamera eine 20-Byte-NOTIFY auf `00020002`: `7f1010040201a8c0020692c17bea903430013c`. Byte 8–13 (`02:06:92:c1:7b:ea`) ist die Phone-MAC aus Canons Sicht, Rest ist der WiFi-Handover-Handshake.
+
+Beim Live-Test mit allen Kamera-Knöpfen (Shutter halb, Shutter voll, Modus-Rad, Blende, ISO, Zoom-Ring): **null NOTIFY-Traffic** auf den Remote-Chars. Also sind die Chars im Smart-Pairing-Modus für körperliche Kamera-Bedienung stumm.
+
+Die Phase-A-Reads verdoppelten außerdem die Subscribe-Phase-Dauer von ~800 ms auf ~1600 ms. Die Sessions blieben in mehreren Tests auf SUBSCRIBING hängen — ob ursächlich durch die Op-Menge oder durch eine separat existierende BT-Instabilität, liess sich im HCI-Snoop nicht eindeutig zuordnen. Phase A wurde rausgenommen, die gewonnenen Daten blieben in der Doku.
+
+### HCI-Snoop gegen Canon Camera Connect
+
+Um das Shutter-Protokoll wirklich zu verstehen (statt aus furble zu raten), wurde die Canon-App im Smart-Pairing-Modus per `adb bugreport`-btsnoop beobachtet während der User Fotos/Videos/Display-Navigation durchspielte. Handle-zu-UUID-Mapping aus dem gleichen Snoop rekonstruiert.
+
+Writes auf unbekannte Handles gefunden:
+
+| Handle | UUID | Semantik |
+|--------|------|----------|
+| `0x0033` | `00030010` | 1-Byte-Writes (`01`/`02`/`03`) — Zoom-CMD oder Review-Navigation |
+| `0x0038` | `00030020` | 4-Byte-Writes (`80000080`/`80000040`) — Exposure-/Display-CMD |
+| `0x003d` | `00030030` | **2-Byte-Press/Release-Codes — Shutter-Char** |
+
+Der 2-Byte-Codespace auf `00030030` zeigte im Snoop mehrere Werte in press/release-Paaren: `0001/0002`, `0010/0011`. Hypothese damals: half-press / full-press.
+
+### Dekompilat-Runde: Canon's eigene Labels
+
+Der Explore-Agent hat das jadx-Dekompilat der Canon-App gezielt nach `writeCharacteristic`-Aufrufen mit der Shutter-Char durchsucht. Fundort: `C0500A.java` Methode `E(int i5)` mit `Log.d`-Strings, Byte-Konstanten in `com.canon.eos.N.java`. Die Byte→Label-Zuordnung kommt direkt aus dem Canon-Code (Log-Strings nicht minifiziert):
+
+```
+0x0001 → AF_REL_ON
+0x0002 → AF_REL_OFF
+0x0003 → AF_ON
+0x0004 → AF_OFF
+0x0005 → REL_ON
+0x0006 → REL_OFF
+0x0010 → MOVIE_START
+0x0011 → MOVIE_STOP
+0x0020 → ZOOM_TELE
+0x0021 → ZOOM_TELE_STOP
+0x0022 → ZOOM_WIDE
+0x0023 → ZOOM_WIDE_STOP
+```
+
+Die Labels sind Canons Benennung, nicht vom Decompiler geraten. Die frühere „half-press"-Hypothese für `0001/0002` passt schon mal nicht zum Canon-Label `AF_REL_ON/OFF` — das suggeriert AF + Release kombiniert, nicht Halb-Drücker. Was die Kamera-Firmware bei den anderen Codes tatsächlich macht haben wir nicht verifiziert. Für das Projekt relevant: `0001/0002` direkt hintereinander löst empirisch ein Foto aus, wenn der Autofokus scharfstellen konnte. Alle anderen Codes blieben ungetestet.
+
+### Implementierung
+
+Minimalster Einstieg: ein Button „Auslösen" in der UI, verfügbar wenn `gpsState == READY_TO_RECEIVE`. Enqueued zwei WRITE_TYPE_DEFAULT-Ops auf `shutterChar` mit den Bytes `00 01` und `00 02`. Kein eigener State, kein Focus-vs-Shutter-Dual, kein Video-Toggle — der User kann die Kamera manuell in Photo-Mode stellen, alles andere ist Folge-Feature.
+
+`CanonGattClient.triggerShutter()` + `GpsTrackingService.ACTION_SHUTTER` + Compose-Button. Schmaler Diff, isolierbar.
+
+### Beobachtungen nach dem ersten Live-Test
+
+- Shutter-Press bei scharfgestelltem Motiv → Foto auf SD-Karte, keine NOTIFYs auf subscribed Chars (1 Datenpunkt).
+- Shutter-Press bei fehlgeschlagenem Autofokus (nichts Fokussierbares) → kein Foto, **aber** NOTIFY `0002 0313` (REMOTE_EVENTS) und `0031 010101` (REMOTE_APERTURE) ~540 ms nach dem zweiten ACK. In zwei Datenpunkten identisches Muster.
+- Die frühe Phase-A-Beobachtung „Remote-Chars sind im Smart-Pairing komplett stumm" stimmte nur solange wir nichts schrieben. BLE-Writes auf die Shutter-Char lösen NOTIFY-Traffic aus; körperliche Kamera-Knöpfe (Fokus-Halb-Drücken etc.) weiter nicht.
+
+### Offen geblieben: GATT-Session-Cycling
+
+Parallel zur Shutter-Arbeit zeigte sich ein Stabilitätsproblem: Sessions brechen manchmal exakt ~2 s nach dem letzten erfolgreichen Paketwechsel mit `status=8` ab (HCI-Connection-Timeout / LL-Response-Timeout), gelegentlich `status=61` (HCI 0x3D, Connection-Establish-Failure). Reconnect läuft sauber, Session ~5–6 s, Abbruch, Reconnect, … im Zyklus.
+
+Nachgeprüft und *nicht* gefunden: keine Korrelation mit Shutter-Button (auch plain-main-Build ohne Phase-C-Diff zeigt das Cycling nach einer Weile), keine FgScanner-Ad-Flood im kritischen Fenster, kein Canon-App-Prozess mehr aktiv, keine orphaned Scan-Registrierung nach `pm clear`. Der Supervision-Timeout steht auf 200 (2 s), gesetzt per `onConnectionUpdated`-Event ~500 ms nach `GPS_SESSION_ACTIVE` — Initiator (Kamera vs. Phone-Stack) aus dem HCI-Log nicht ableitbar.
+
+Keine Hypothese die ich belegen kann. Dokumentiert als offener Punkt für die nächste Runde.
+
 ## Nachbetrachtung — was wir rückblickend hätten wissen können
 
 Nach Abschluss von Phase 6 haben wir die Literaturrecherche gemacht die wir vor Projektstart hätten machen sollen. Ergebnisse, geordnet nach Überlappung mit unserem Projekt:

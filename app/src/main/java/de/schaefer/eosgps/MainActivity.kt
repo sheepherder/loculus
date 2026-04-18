@@ -292,6 +292,19 @@ fun AppScreen() {
 
         Spacer(Modifier.height(8.dp))
 
+        // Kamera-Steuerung: nur während aktiver GPS-Session verfügbar, weil
+        // die Shutter-Writes sowieso am READY_TO_RECEIVE-Gate in
+        // CanonGattClient abprallen.
+        if (gpsState == CanonGpsState.READY_TO_RECEIVE) {
+            InfoCard("Kamera-Steuerung") {
+                Button(
+                    onClick = { GpsTrackingService.triggerShutter(ctx) },
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                ) { Text("Auslösen") }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
         InfoCard("Tracking") {
             Row(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
