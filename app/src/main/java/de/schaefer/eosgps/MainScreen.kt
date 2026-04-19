@@ -101,7 +101,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
     }
 
     var nowTick by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    LaunchedEffect(lifecycleOwner) {
+    LaunchedEffect(Unit) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 nowTick = SystemClock.elapsedRealtime()
@@ -266,7 +266,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
 
         Spacer(Modifier.height(8.dp))
 
-        InfoCard("GPS-Tracking") {
+        InfoCard("GPS-Übertragung") {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -398,12 +398,5 @@ private fun rssiColor(rssi: Int?): Color = when {
     rssi == null -> Color(0xFF9E9E9E)
     rssi >= -60 -> Color(0xFF4CAF50)
     rssi >= -75 -> Color(0xFFFFB74D)
-    else -> Color(0xFFE57373)
-}
-
-private fun accuracyColor(acc: Float?): Color = when {
-    acc == null -> Color.Unspecified
-    acc <= 5f -> Color(0xFF4CAF50)
-    acc <= 15f -> Color(0xFFFFB74D)
     else -> Color(0xFFE57373)
 }

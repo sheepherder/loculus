@@ -8,7 +8,6 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.content.Context
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -130,11 +129,14 @@ class CanonGattClient(
 
     private val opQueue = ArrayDeque<GattOp>()
     @Volatile private var opInFlight = false
-    private var noResponseSelfCompleted = 0
 
     private val handler = Handler(Looper.getMainLooper())
     private val stateTimeout = Runnable {
         when (state) {
+            ConnState.CONNECTING, ConnState.DISCOVERING, ConnState.SUBSCRIBING -> {
+                Log.w(TAG, "$state timeout (15s) — disconnecting")
+                doDisconnect()
+            }
             ConnState.REQUESTING_GPS -> {
                 Log.w(TAG, "REQUESTING_GPS timeout (10s) — disconnecting")
                 doDisconnect()
@@ -167,7 +169,15 @@ class CanonGattClient(
         if (state != ConnState.IDLE) { Log.i(TAG,"connect ignored, state=$state"); return }
         Log.i(TAG,"connect ${device.address}")
         state = ConnState.CONNECTING
-        gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        val g = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        if (g == null) {
+            Log.w(TAG, "connectGatt returned null")
+            state = ConnState.IDLE
+            return
+        }
+        gatt = g
+        handler.removeCallbacks(stateTimeout)
+        handler.postDelayed(stateTimeout, 15_000L)
     }
 
     /** Request a fresh RSSI reading from the connected GATT link. Result arrives via onRssi. */
@@ -252,14 +262,7 @@ class CanonGattClient(
             val ok = when (op) {
                 is GattOp.Write -> {
                     Log.i(TAG,"→ write ${op.label} (${op.data.size}B, type=${op.writeType})")
-                    val success = writeChar(g, op.ch, op.data, op.writeType)
-                    if (op.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && success) {
-                        noResponseSelfCompleted++
-                        opInFlight = false
-                        pump()
-                        return
-                    }
-                    success
+                    writeChar(g, op.ch, op.data, op.writeType)
                 }
                 is GattOp.WriteDesc -> {
                     Log.i(TAG,"→ write descriptor ${op.label}")
@@ -282,34 +285,18 @@ class CanonGattClient(
         }
     }
 
+    private fun clearQueue() = synchronized(opQueue) { opQueue.clear(); opInFlight = false }
+
     private fun opCompleted() {
         synchronized(opQueue) { opInFlight = false }
         pump()
     }
 
-    private fun writeChar(g: BluetoothGatt, ch: BluetoothGattCharacteristic, data: ByteArray, writeType: Int): Boolean {
-        return if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(ch, data, writeType) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            ch.writeType = writeType
-            @Suppress("DEPRECATION")
-            ch.value = data
-            @Suppress("DEPRECATION")
-            g.writeCharacteristic(ch)
-        }
-    }
+    private fun writeChar(g: BluetoothGatt, ch: BluetoothGattCharacteristic, data: ByteArray, writeType: Int): Boolean =
+        g.writeCharacteristic(ch, data, writeType) == BluetoothGatt.GATT_SUCCESS
 
-    private fun writeDesc(g: BluetoothGatt, desc: BluetoothGattDescriptor, data: ByteArray): Boolean {
-        return if (Build.VERSION.SDK_INT >= 33) {
-            g.writeDescriptor(desc, data) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            desc.value = data
-            @Suppress("DEPRECATION")
-            g.writeDescriptor(desc)
-        }
-    }
+    private fun writeDesc(g: BluetoothGatt, desc: BluetoothGattDescriptor, data: ByteArray): Boolean =
+        g.writeDescriptor(desc, data) == BluetoothGatt.GATT_SUCCESS
 
     // --- GATT callback ---
 
@@ -329,7 +316,7 @@ class CanonGattClient(
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 handler.removeCallbacks(stateTimeout)
                 lastDisconnectStatus = status
-                synchronized(opQueue) { opQueue.clear(); opInFlight = false; noResponseSelfCompleted = 0 }
+                clearQueue()
                 g.close()
                 if (gatt === g) gatt = null
                 statusChar = null; dataChar = null; notifyChar = null
@@ -419,6 +406,12 @@ class CanonGattClient(
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             Log.i(TAG,"onDescriptorWrite ${shortUuid(descriptor.characteristic.uuid)} status=$status")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "CCCD write failed status=$status — disconnecting")
+                clearQueue()
+                doDisconnect()
+                return
+            }
             opCompleted()
             if (state == ConnState.SUBSCRIBING) {
                 synchronized(opQueue) {
@@ -462,15 +455,6 @@ class CanonGattClient(
             if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, value)
         }
 
-        @Deprecated("legacy pre-33")
-        override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            @Suppress("DEPRECATION")
-            val v = ch.value ?: ByteArray(0)
-            Log.i(TAG,"onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${v.toHexCompact()}")
-            opCompleted()
-            if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, v)
-        }
-
         private fun routeRead(ch: BluetoothGattCharacteristic, value: ByteArray) {
             // NOTE: do NOT drive gpsState from reads. Read values reflect the
             // camera's last persisted state, not current aliveness. We only
@@ -491,12 +475,6 @@ class CanonGattClient(
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
             Log.i(TAG,"onCharacteristicWrite ${shortUuid(ch.uuid)} status=$status")
             onWriteResult(status)
-            synchronized(opQueue) {
-                if (noResponseSelfCompleted > 0) {
-                    noResponseSelfCompleted--
-                    return
-                }
-            }
             opCompleted()
             if (state == ConnState.STOPPING) {
                 synchronized(opQueue) {
@@ -528,14 +506,6 @@ class CanonGattClient(
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
             Log.i(TAG,"NOTIFY ${shortUuid(ch.uuid)} ${value.toHexCompact()}")
             handleStateByte(ch, value)
-        }
-
-        @Deprecated("legacy pre-33")
-        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION")
-            val v = ch.value ?: return
-            Log.i(TAG,"NOTIFY ${shortUuid(ch.uuid)} ${v.toHexCompact()}")
-            handleStateByte(ch, v)
         }
 
         /**

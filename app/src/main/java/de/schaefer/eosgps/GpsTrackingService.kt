@@ -51,6 +51,9 @@ class GpsTrackingService : Service() {
     private var bondedDevice: BluetoothDevice? = null
     private val fused by lazy { LocationServices.getFusedLocationProviderClient(applicationContext) }
     private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var notifMgr: NotificationManager
+    private lateinit var tapIntent: PendingIntent
+    private lateinit var stopPendingIntent: PendingIntent
 
     private val rssiPollRunnable = object : Runnable {
         override fun run() {
@@ -64,6 +67,17 @@ class GpsTrackingService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "onCreate")
+        notifMgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        tapIntent = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        stopPendingIntent = PendingIntent.getService(
+            this, 1,
+            Intent(this, GpsTrackingService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         createNotificationChannel()
     }
 
@@ -142,6 +156,8 @@ class GpsTrackingService : Service() {
         fused.removeLocationUpdates(locationCallback)
         activeService = null
         gatt?.stopAndDisconnect()
+        // Null before async disconnect returns — prevents the IDLE callback
+        // from re-entering stopTracking() via onGattDisconnected().
         gatt = null
         bondedDevice = null
         TrackingState.connState.value = ConnState.IDLE
@@ -242,7 +258,7 @@ class GpsTrackingService : Service() {
         if (ok) {
             TrackingState.fixCount.value += 1
             TrackingState.lastFixText.value =
-                "%.6f, %.6f".format(loc.latitude, loc.longitude)
+                String.format(java.util.Locale.US, "%.6f, %.6f", loc.latitude, loc.longitude)
             TrackingState.lastFixAt.value = SystemClock.elapsedRealtime()
             TrackingState.accuracy.value = if (loc.hasAccuracy()) loc.accuracy else null
             TrackingState.altitude.value = if (loc.hasAltitude()) loc.altitude else null
@@ -254,35 +270,23 @@ class GpsTrackingService : Service() {
     // --- Notification ---
 
     private fun createNotificationChannel() {
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val ch = NotificationChannel(CHANNEL_ID, "EOS GPS Tracking",
+        val ch = NotificationChannel(CHANNEL_ID, "GPS-Übertragung",
             NotificationManager.IMPORTANCE_LOW).apply {
             description = "Live GPS forwarding to Canon EOS"
             setShowBadge(false)
         }
-        mgr.createNotificationChannel(ch)
+        notifMgr.createNotificationChannel(ch)
     }
 
-    private fun buildNotification(text: String): Notification {
-        val tapIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val stopIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, GpsTrackingService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(text: String): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("EOS GPS")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .setContentIntent(tapIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .build()
-    }
 
     private fun updateNotification() {
         val power = TrackingState.cameraPower.value
@@ -290,8 +294,7 @@ class GpsTrackingService : Service() {
         val fixes = TrackingState.fixCount.value
         val last = TrackingState.lastFixText.value ?: "—"
         val text = "${power.label()} · $conn · $fixes fixes · $last"
-        val mgr = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        mgr.notify(NOTIF_ID, buildNotification(text))
+        notifMgr.notify(NOTIF_ID, buildNotification(text))
     }
 
     companion object {

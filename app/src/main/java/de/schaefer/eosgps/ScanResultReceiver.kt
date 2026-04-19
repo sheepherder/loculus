@@ -5,7 +5,6 @@ import android.bluetooth.le.ScanResult
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.util.Log
 
 private const val TAG = "ScanResultReceiver"
@@ -25,14 +24,9 @@ class ScanResultReceiver : BroadcastReceiver() {
             return
         }
 
-        val results: List<ScanResult> = if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableArrayListExtra(
-                BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT, ScanResult::class.java
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
-        } ?: emptyList()
+        val results: List<ScanResult> = intent.getParcelableArrayListExtra(
+            BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT, ScanResult::class.java
+        ) ?: emptyList()
 
         if (results.isEmpty()) return
         // A PendingIntent that was already queued by the BT stack can still

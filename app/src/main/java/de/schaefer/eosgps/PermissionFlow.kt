@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -69,14 +68,12 @@ internal fun permGroups(): List<PermGroup> = buildList {
         permissions = listOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
         isGranted = { hasBackgroundLocation(it) },
     ))
-    if (Build.VERSION.SDK_INT >= 33) {
-        add(PermGroup(
-            title = "Benachrichtigungen",
-            description = "Während GPS an die Kamera gestreamt wird, zeigt die App eine Benachrichtigung. So weißt du immer, wenn die Verbindung aktiv ist.",
-            permissions = listOf(Manifest.permission.POST_NOTIFICATIONS),
-            isGranted = { ContextCompat.checkSelfPermission(it, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED },
-        ))
-    }
+    add(PermGroup(
+        title = "Benachrichtigungen",
+        description = "Während GPS an die Kamera gestreamt wird, zeigt die App eine Benachrichtigung. So weißt du immer, wenn die Verbindung aktiv ist.",
+        permissions = listOf(Manifest.permission.POST_NOTIFICATIONS),
+        isGranted = { ContextCompat.checkSelfPermission(it, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED },
+    ))
     add(PermGroup(
         title = "Akku-Optimierung",
         description = "Ohne diese Ausnahme kann Android die App im Hintergrund drosseln und die Bluetooth-Verbindung unterbrechen.",
