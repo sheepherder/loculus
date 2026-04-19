@@ -86,7 +86,7 @@ object FgScanner {
             Log.w(TAG, "scanner preflight failed")
             return
         }
-        val target = findBondedCanon(ctx) ?: run {
+        val target = findSelectedDevice(ctx) ?: run {
             Log.w(TAG, "no bonded EOS device")
             return
         }

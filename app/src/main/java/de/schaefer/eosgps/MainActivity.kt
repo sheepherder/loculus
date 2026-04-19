@@ -13,9 +13,15 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -38,12 +44,13 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -53,20 +60,19 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 
-// Camera advertises ~200 ms awake, ~3 s asleep. Eight seconds without a
-// single advertisement means the camera is gone (battery pulled, out of
-// range, or physically off beyond BLE standby). Used for the UI-side
-// staleness derivation when no GATT session is active.
 private const val AD_STALENESS_MS = 8_000L
+
+private enum class Screen { PERMISSION, DEVICE_PICKER, MAIN }
 
 class MainActivity : ComponentActivity() {
 
@@ -96,12 +102,325 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@SuppressLint("MissingPermission")
+// ---------------------------------------------------------------------------
+// Screen router
+// ---------------------------------------------------------------------------
+
+private fun currentScreen(ctx: Context): Screen = when {
+    !hasAllPerms(ctx) -> Screen.PERMISSION
+    findSelectedDevice(ctx) == null -> Screen.DEVICE_PICKER
+    else -> Screen.MAIN
+}
+
 @Composable
 fun AppScreen() {
     val ctx = LocalContext.current
-    var permsGranted by remember { mutableStateOf(hasAllPerms(ctx)) }
-    var bondedCanon by remember { mutableStateOf<BluetoothDevice?>(null) }
+    resolveSelectedDevice(ctx)
+    var screen by remember { mutableStateOf(currentScreen(ctx)) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                resolveSelectedDevice(ctx)
+                screen = currentScreen(ctx)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    when (screen) {
+        Screen.PERMISSION -> PermissionFlow(onDone = {
+            resolveSelectedDevice(ctx)
+            screen = currentScreen(ctx)
+        })
+        Screen.DEVICE_PICKER -> DevicePicker(
+            onDeviceSelected = { screen = currentScreen(ctx) },
+            onBack = if (Prefs.selectedDeviceMac(ctx) != null) {{
+                FgScanner.start(ctx)
+                screen = Screen.MAIN
+            }} else null,
+        )
+        Screen.MAIN -> MainScreen(onChangeDevice = {
+            if (TrackingState.serviceRunning.value) {
+                GpsTrackingService.stop(ctx)
+            }
+            CanonScanRegistrar.unregister(ctx)
+            FgScanner.stop()
+            screen = Screen.DEVICE_PICKER
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Permission flow — one group per screen, sequentially
+// ---------------------------------------------------------------------------
+
+private data class PermGroup(
+    val title: String,
+    val description: String,
+    val permissions: List<String>?,
+    val isGranted: (Context) -> Boolean,
+    val isBatteryOpt: Boolean = false,
+)
+
+private fun permGroups(): List<PermGroup> = buildList {
+    add(PermGroup(
+        title = "Bluetooth",
+        description = "Die App kommuniziert per Bluetooth LE mit deiner Canon-Kamera. Dafür braucht sie Zugriff auf Bluetooth.",
+        permissions = listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN),
+        isGranted = { hasBluetoothPermissions(it) },
+    ))
+    add(PermGroup(
+        title = "Standort",
+        description = "GPS-Koordinaten werden an die Kamera gesendet und in die EXIF-Daten deiner Fotos geschrieben. Außerdem benötigt Android Standortzugriff für Bluetooth-LE-Scans.",
+        permissions = listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+        isGranted = { ContextCompat.checkSelfPermission(it, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED },
+    ))
+    add(PermGroup(
+        title = "Hintergrund-Standort",
+        description = "Damit GPS auch bei geschlossener App an die Kamera gestreamt wird, muss der Standortzugriff auf 'Immer zulassen' stehen.",
+        permissions = listOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
+        isGranted = { hasBackgroundLocation(it) },
+    ))
+    if (Build.VERSION.SDK_INT >= 33) {
+        add(PermGroup(
+            title = "Benachrichtigungen",
+            description = "Während GPS an die Kamera gestreamt wird, zeigt die App eine Benachrichtigung. So weißt du immer, wenn die Verbindung aktiv ist.",
+            permissions = listOf(Manifest.permission.POST_NOTIFICATIONS),
+            isGranted = { ContextCompat.checkSelfPermission(it, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED },
+        ))
+    }
+    add(PermGroup(
+        title = "Akku-Optimierung",
+        description = "Ohne diese Ausnahme kann Android die App im Hintergrund drosseln und die Bluetooth-Verbindung unterbrechen.",
+        permissions = null,
+        isGranted = { isBatteryOptIgnored(it) },
+        isBatteryOpt = true,
+    ))
+}
+
+@Composable
+private fun PermissionFlow(onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    val groups = remember { permGroups() }
+    var refreshKey by remember { mutableIntStateOf(0) }
+
+    val pending = groups.filter { !it.isGranted(ctx) }
+    if (pending.isEmpty()) {
+        LaunchedEffect(Unit) { onDone() }
+        return
+    }
+    val group = pending.first()
+
+    val multiPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { refreshKey++ }
+
+    val singlePermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { refreshKey++ }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) refreshKey++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 32.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            "EOS GPS",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(48.dp))
+        Text(
+            group.title,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            group.description,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(32.dp))
+        Button(
+            onClick = {
+                if (group.isBatteryOpt) {
+                    requestBatteryOptExemption(ctx)
+                } else {
+                    val perms = group.permissions ?: return@Button
+                    if (perms.size == 1) {
+                        singlePermLauncher.launch(perms[0])
+                    } else {
+                        multiPermLauncher.launch(perms.toTypedArray())
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (group.isBatteryOpt) "Einstellung öffnen" else "Erlauben")
+        }
+
+        if (!group.isBatteryOpt && group.permissions != null) {
+            val anyDenied = group.permissions.any {
+                ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (anyDenied && refreshKey > 0) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Falls die Abfrage nicht erscheint: in den App-Einstellungen aktivieren.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        .setData(Uri.fromParts("package", ctx.packageName, null))
+                        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(intent)
+                }) {
+                    Text("App-Einstellungen")
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device picker
+// ---------------------------------------------------------------------------
+
+@SuppressLint("MissingPermission")
+@Composable
+private fun DevicePicker(onDeviceSelected: () -> Unit, onBack: (() -> Unit)? = null) {
+    if (onBack != null) {
+        BackHandler(onBack = onBack)
+    }
+    val ctx = LocalContext.current
+    var devices by remember { mutableStateOf(findAllBondedCanon(ctx)) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                devices = findAllBondedCanon(ctx)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 32.dp)
+            .verticalScroll(rememberScrollState()),
+    ) {
+        Text(
+            "EOS GPS",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(32.dp))
+        Text(
+            "Kamera auswählen",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Wähle die Canon-Kamera, die GPS-Daten empfangen soll.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(24.dp))
+
+        if (devices.isEmpty()) {
+            Text(
+                "Keine Canon-Kamera gekoppelt.\n\nKopple deine Kamera zuerst über die Canon Camera Connect App oder die Android Bluetooth-Einstellungen.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(16.dp))
+            OutlinedButton(onClick = {
+                ctx.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+                    .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }) {
+                Text("Bluetooth-Einstellungen")
+            }
+        } else {
+            val currentMac = Prefs.selectedDeviceMac(ctx)
+            for (device in devices) {
+                val isSelected = device.address == currentMac
+                ElevatedCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clickable {
+                            Prefs.setSelectedDeviceMac(ctx, device.address)
+                            onDeviceSelected()
+                        },
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (isSelected) MaterialTheme.colorScheme.primary
+                                    else Color.Transparent
+                                ),
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                        Text(
+                            device.name ?: "Canon EOS",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            device.address,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick = { devices = findAllBondedCanon(ctx) }) {
+            Text("Aktualisieren")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main screen (existing UI, extracted)
+// ---------------------------------------------------------------------------
+
+@SuppressLint("MissingPermission")
+@Composable
+private fun MainScreen(onChangeDevice: () -> Unit) {
+    val ctx = LocalContext.current
+    var selectedDevice by remember { mutableStateOf(findSelectedDevice(ctx)) }
 
     val connState by TrackingState.connState.collectAsState()
     val gpsState by TrackingState.gpsState.collectAsState()
@@ -114,20 +433,8 @@ fun AppScreen() {
     val lastFixAt by TrackingState.lastFixAt.collectAsState()
     val writeErrors by TrackingState.writeErrors.collectAsState()
 
-    // The single user switch. Persisted in Prefs; UI mirrors it so toggles
-    // feel instant and we sync Prefs + scanner side-effects on click.
     var trackingEnabled by remember { mutableStateOf(Prefs.trackingEnabled(ctx)) }
-    var batteryOptIgnored by remember { mutableStateOf(isBatteryOptIgnored(ctx)) }
-    var backgroundLocationGranted by remember { mutableStateOf(hasBackgroundLocation(ctx)) }
 
-    // Activity-scoped scanner lifecycle.
-    //  ON_RESUME: unregister the OS-offloaded scan (our live scanner takes
-    //             over), start the live scanner. Re-read permission state —
-    //             user may have flipped something in Settings while we were
-    //             away.
-    //  ON_PAUSE:  stop the live scanner. If tracking is on and no GATT
-    //             session is active, arm the OS-offloaded scan so the system
-    //             wakes us on the next POWER_ON advertisement.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -135,9 +442,8 @@ fun AppScreen() {
                 Lifecycle.Event.ON_RESUME -> {
                     CanonScanRegistrar.unregister(ctx)
                     FgScanner.start(ctx)
-                    batteryOptIgnored = isBatteryOptIgnored(ctx)
-                    backgroundLocationGranted = hasBackgroundLocation(ctx)
                     trackingEnabled = Prefs.trackingEnabled(ctx)
+                    selectedDevice = findSelectedDevice(ctx)
                 }
                 Lifecycle.Event.ON_PAUSE -> {
                     FgScanner.stop()
@@ -152,8 +458,6 @@ fun AppScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // 1 Hz ticker for "X ago" displays. Bound to STARTED so it pauses
-    // automatically while the Activity is in the background.
     var nowTick by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     LaunchedEffect(lifecycleOwner) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -164,75 +468,31 @@ fun AppScreen() {
         }
     }
 
-    val permLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        permsGranted = results.values.all { it }
-        if (permsGranted) {
-            bondedCanon = findBondedCanon(ctx)
-            // Permissions may have just been granted — kick the scanner so
-            // the first ads land immediately.
-            FgScanner.start(ctx)
-        }
-    }
-
-    // Background-location has to be asked for separately on Android 11+ —
-    // the system dialog triggered by this request steers the user to
-    // Settings with "Allow all the time".
-    val backgroundLocationLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        backgroundLocationGranted = granted
-    }
-
-    LaunchedEffect(permsGranted) {
-        if (permsGranted) bondedCanon = findBondedCanon(ctx)
+    val effectivePower = when {
+        connState != ConnState.IDLE -> cameraPower
+        lastAdvertAt == null -> CameraPowerState.UNSEEN
+        nowTick - lastAdvertAt!! > AD_STALENESS_MS -> CameraPowerState.UNSEEN
+        else -> cameraPower
     }
 
     Column(
         modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp)
+            .verticalScroll(rememberScrollState()),
     ) {
-        Column {
-            Text("EOS GPS", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-            Text(
-                bondedCanon?.name ?: "no bonded EOS",
-                fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        Text("EOS GPS", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Text(
+            selectedDevice?.name ?: "—",
+            fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
         Spacer(Modifier.height(10.dp))
-
-        // Derive the displayed power state from advertisement freshness. If
-        // the camera went out of range / lost its battery, ads simply stop —
-        // the last remembered state (e.g. POWER_ON) is then meaningless. We
-        // don't keep a separate watchdog timer: nowTick already ticks once
-        // per second, so this recomputes on every tick for free.
-        //
-        // During a GATT session the camera deliberately stops advertising;
-        // trust the last known state instead of flipping to UNSEEN.
-        val effectivePower = when {
-            connState != ConnState.IDLE -> cameraPower
-            lastAdvertAt == null -> CameraPowerState.UNSEEN
-            nowTick - lastAdvertAt!! > AD_STALENESS_MS -> CameraPowerState.UNSEEN
-            else -> cameraPower
-        }
 
         InfoCard("Connection") {
             KeyValueRow("power") {
                 StatusDot(color = powerStateColor(effectivePower))
                 Spacer(Modifier.width(6.dp))
                 MonoText(effectivePower.label())
-                // Camera stops advertising during a GATT session; hide the
-                // age then so it doesn't grow meaninglessly.
-                if (lastAdvertAt != null && connState == ConnState.IDLE) {
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        "adv ${formatDuration(nowTick - lastAdvertAt!!)} ago",
-                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
             }
             KeyValueRow("link") {
                 StatusDot(color = connStateColor(connState))
@@ -257,9 +517,31 @@ fun AppScreen() {
 
         Spacer(Modifier.height(8.dp))
 
-        InfoCard("Camera") {
-            KeyValueRow("name") { MonoText(bondedCanon?.name ?: "—") }
-            KeyValueRow("mac") { MonoText(bondedCanon?.address ?: "—") }
+        ElevatedCard(
+            modifier = Modifier.fillMaxWidth().clickable { onChangeDevice() },
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "CAMERA",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "ändern",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Spacer(Modifier.height(4.dp))
+                KeyValueRow("name") { MonoText(selectedDevice?.name ?: "—") }
+                KeyValueRow("mac") { MonoText(selectedDevice?.address ?: "—") }
+            }
         }
 
         Spacer(Modifier.height(8.dp))
@@ -292,100 +574,84 @@ fun AppScreen() {
 
         Spacer(Modifier.height(8.dp))
 
-        // Kamera-Steuerung: nur während aktiver GPS-Session verfügbar, weil
-        // die Shutter-Writes sowieso am READY_TO_RECEIVE-Gate in
-        // CanonGattClient abprallen.
-        if (gpsState == CanonGpsState.READY_TO_RECEIVE) {
-            InfoCard("Kamera-Steuerung") {
-                Button(
-                    onClick = { GpsTrackingService.triggerShutter(ctx) },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                ) { Text("Auslösen") }
-            }
-            Spacer(Modifier.height(8.dp))
-        }
-
-        InfoCard("Tracking") {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
+        val shutterReady = gpsState == CanonGpsState.READY_TO_RECEIVE
+        ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    MonoText(if (trackingEnabled) "on" else "off", bold = true)
-                    Text(
-                        if (trackingEnabled)
-                            "verbindet & streamt GPS sobald die Kamera angeht"
-                        else
-                            "zeigt nur Ads, kein GPS-Transmit",
-                        fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                Text(
+                    "AUSLÖSER",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (shutterReady) Color.White
+                            else Color(0xFF444444)
+                        )
+                        .clickable(enabled = shutterReady) {
+                            GpsTrackingService.triggerShutter(ctx)
+                        }
+                        .padding(4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (shutterReady) Color(0xFFE0E0E0)
+                                else Color(0xFF333333)
+                            ),
                     )
                 }
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        InfoCard("GPS-Tracking") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    if (trackingEnabled) "Aktiv" else "Aus",
+                    fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (trackingEnabled) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Switch(
                     checked = trackingEnabled,
-                    enabled = permsGranted && bondedCanon != null,
                     onCheckedChange = { want ->
                         trackingEnabled = want
                         Prefs.setTrackingEnabled(ctx, want)
                         if (!want) {
-                            // OFF: tear everything down. Defensive unregister
-                            // even if we think nothing is armed.
                             CanonScanRegistrar.unregister(ctx)
                             if (TrackingState.serviceRunning.value) {
                                 GpsTrackingService.stop(ctx)
                             }
                         }
-                        // ON: nothing to do here. Activity is visible (we're
-                        // in a click handler), FgScanner is already running,
-                        // and it will start the FGS on the next POWER_ON ad.
-                        // The OS-offloaded scan gets armed on our next
-                        // ON_PAUSE handoff.
                     },
                     colors = SwitchDefaults.colors(),
                 )
             }
-            if (trackingEnabled && !batteryOptIgnored) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Akku-Optimierung ausschalten, sonst throttelt Android den Scan",
-                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                    color = Color(0xFFFFB74D),
-                )
-                Spacer(Modifier.height(4.dp))
-                OutlinedButton(onClick = { requestBatteryOptExemption(ctx) }) {
-                    Text("Akku-Optimierung öffnen")
-                }
-            }
-            if (trackingEnabled && !backgroundLocationGranted) {
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Hintergrund-Ortung: ohne 'Immer zulassen' kommen Fixes nur wenn App offen ist",
-                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
-                    color = Color(0xFFFFB74D),
-                )
-                Spacer(Modifier.height(4.dp))
-                OutlinedButton(onClick = {
-                    backgroundLocationLauncher.launch(
-                        Manifest.permission.ACCESS_BACKGROUND_LOCATION
-                    )
-                }) {
-                    Text("Hintergrund-Ortung freigeben")
-                }
-            }
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        if (!permsGranted) {
-            Button(
-                onClick = { permLauncher.launch(allPerms()) },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Grant permissions")
-            }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared composables
+// ---------------------------------------------------------------------------
 
 @Composable
 private fun InfoCard(title: String, content: @Composable () -> Unit) {
@@ -440,6 +706,10 @@ private fun StatusDot(color: Color) {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 private fun formatDuration(ms: Long): String {
     if (ms < 0) return "0:00"
     val totalSec = ms / 1000
@@ -470,10 +740,10 @@ private fun gpsStateColor(s: CanonGpsState): Color = when (s) {
 }
 
 private fun powerStateColor(s: CameraPowerState): Color = when (s) {
-    CameraPowerState.POWER_ON -> Color(0xFF4CAF50)         // green
-    CameraPowerState.AUTO_POWER_OFF -> Color(0xFFFFB74D)   // orange
-    CameraPowerState.POWER_SW_OFF -> Color(0xFF9E9E9E)     // grey (deliberate off)
-    CameraPowerState.UNSEEN -> Color(0xFF757575)           // dim grey (no contact)
+    CameraPowerState.POWER_ON -> Color(0xFF4CAF50)
+    CameraPowerState.AUTO_POWER_OFF -> Color(0xFFFFB74D)
+    CameraPowerState.POWER_SW_OFF -> Color(0xFF9E9E9E)
+    CameraPowerState.UNSEEN -> Color(0xFF757575)
 }
 
 private fun rssiColor(rssi: Int?): Color = when {
@@ -483,20 +753,8 @@ private fun rssiColor(rssi: Int?): Color = when {
     else -> Color(0xFFE57373)
 }
 
-private fun allPerms(): Array<String> {
-    val base = mutableListOf(
-        Manifest.permission.BLUETOOTH_CONNECT,
-        Manifest.permission.BLUETOOTH_SCAN,
-        Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.ACCESS_COARSE_LOCATION,
-    )
-    if (Build.VERSION.SDK_INT >= 33) base += Manifest.permission.POST_NOTIFICATIONS
-    return base.toTypedArray()
-}
-
-private fun hasAllPerms(ctx: Context): Boolean = allPerms().all {
-    ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
-}
+private fun hasAllPerms(ctx: Context): Boolean =
+    permGroups().all { it.isGranted(ctx) }
 
 private fun isBatteryOptIgnored(ctx: Context): Boolean {
     val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager

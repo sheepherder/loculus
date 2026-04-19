@@ -683,3 +683,72 @@ Wäre ein dankbarer PR an `gkoh/furble` um dort die Canon-Scan-Robustheit mit de
 - **Verschiedene Contexte fürs selbe „wann bin ich sichtbar"-Flag.** Phase 8 hatte kurzzeitig `MainActivity.isVisible` als `@Volatile var` im Companion — der Service griff direkt in die Activity-Klasse. Sauberer: ein geteiltes Flag im State-Holder (`TrackingState.appVisible`). Allgemeiner: **wenn ein Service sich für den UI-Lebenszyklus interessiert, gehört die Kopplung über ein shared state object, nicht über direkten Klassen-Zugriff.** Das vermeidet zirkuläre Abhängigkeiten und macht Testing trivial.
 - **Hard-Gates gegen in-flight asynchrone Trigger.** Ein `PendingIntent` der beim BT-Stack schon in der Queue liegt, wird auch dann noch zugestellt wenn dein Code ihn „abgemeldet" hat. Gleiches gilt für noch nicht konsumierte Intent-Broadcasts. **Jeder Entry-Point ins FGS** sollte den aktuellen Prefs-Zustand prüfen, nicht nur dem Aufrufer vertrauen — der Aufrufer könnte aus einer veralteten Welt kommen. Zwei Zeilen Defensive Code, verhindern sonst subtile „warum baut die App jetzt eine Session auf obwohl ich Tracking aus hatte"-Bugs.
 - **Parallele Review-Agenten finden andere Bugs als sequenzielle.** Vier unabhängige Reviews (drei Claude-Subagenten, einer Codex via MCP) fanden je *eigene* Probleme — der Reuse-Agent die DRY-Chancen, der Quality-Agent den `restartRunnable`-Double-Post, der Efficiency-Agent den Compose-Ticker-Leak, Codex das fehlende Hard-Gate und die leaky `isVisible`. Keiner davon hätte alleine alle fünf gefunden. **Refactor-Reviews sind embarrassingly parallel** — verschiedene Brillen lesen denselben Diff und priorisieren unterschiedlich. Kostet ein paar Dollar Tokens und spart einen Tag Bug-Hunt.
+
+## Phase 10 — Onboarding, Kamera-Auswahl, UI-Verbesserungen (April 2026)
+
+Die App war bisher nur für den Entwickler benutzbar: `findBondedCanon()` nahm blind das erste gebondete "EOS"-Gerät, Permissions wurden als undifferenzierter Block abgefragt, es gab keinen Erst-Start-Flow. Phase 10 macht die App für andere benutzbar.
+
+### Onboarding-Flow
+
+Screen-State-Machine statt Navigation-Library (App hat eine Activity):
+
+```
+enum class Screen { PERMISSION, DEVICE_PICKER, MAIN }
+```
+
+Bei jedem `onResume` wird der Screen neu bestimmt: fehlende Permissions → `PERMISSION`, kein Gerät gewählt → `DEVICE_PICKER`, sonst → `MAIN`. Kommt der User aus den Settings zurück und hat eine Permission entzogen, landet er automatisch auf dem Permission-Screen.
+
+Fünf Permission-Gruppen werden sequenziell abgefragt, jeweils mit eigenem Erklärungsscreen und "Erlauben"-Button:
+
+1. **Bluetooth** (CONNECT + SCAN) — "Die App kommuniziert per Bluetooth LE mit deiner Canon-Kamera."
+2. **Standort** (FINE + COARSE) — "GPS-Koordinaten werden an die Kamera gesendet. Android benötigt Standortzugriff für BLE-Scans."
+3. **Hintergrund-Standort** (BACKGROUND_LOCATION, separat wegen Android 11+) — "Damit GPS auch bei geschlossener App gestreamt wird."
+4. **Benachrichtigungen** (POST_NOTIFICATIONS, API 33+) — "Zeigt eine Benachrichtigung während GPS gestreamt wird."
+5. **Akku-Optimierung** (Intent, kein Runtime-Permission) — "Ohne diese Ausnahme kann Android die App drosseln."
+
+`hasAllPerms()` leitet sich direkt aus `permGroups()` ab — eine einzige Quelle der Wahrheit, kein Drift-Risiko.
+
+Bei "Don't ask again" erscheint ein Hinweis mit Button zu den App-Einstellungen.
+
+### Kamera-Auswahl
+
+`findBondedCanon()` (blind erstes "EOS"-Gerät) wurde ersetzt durch drei Funktionen in `Bluetooth.kt`:
+
+- `findSelectedDevice()` — liest persistierte MAC aus `Prefs.selectedDeviceMac`, sucht in Bonded-Devices
+- `findAllBondedCanon()` — alle gebondeten Canon-EOS-Geräte für den Picker
+- `resolveSelectedDevice()` — Auto-Select: wenn genau 1 EOS gebondet → automatisch persistieren; bei 0 oder 2+ → null (Picker muss ran)
+
+MAC wird in `Prefs.selectedDeviceMac` persistiert. Alle Scanner/Service-Call-Sites (`FgScanner`, `CanonScanRegistrar`, `GpsTrackingService`) nutzen `findSelectedDevice()`.
+
+Der Device-Picker zeigt alle gebondeten EOS-Kameras mit Name + MAC. Aktuell ausgewählte Kamera ist mit farbigem Punkt markiert. Bei leerer Liste: Hinweis + Button "Bluetooth-Einstellungen öffnen". "Aktualisieren"-Button für Neuladen nach Pairing.
+
+Kamera-Wechsel: Camera-Card im Main-Screen ist tappbar (mit "ändern"-Label). Tap stoppt laufende GATT-Session, entfernt OS-Scan-Registrierung, öffnet den Picker. Back-Button im Picker führt zurück zum Main-Screen (nur wenn bereits eine Kamera persistiert ist).
+
+### UI-Verbesserungen
+
+- **Tracking-Default auf `true`** — App ist bei Erstinstallation sofort betriebsbereit
+- **Tracking-Card vereinfacht** — nur "Aktiv"/"Aus" (grün/grau) + Switch, keine mehrzeilige Beschreibung
+- **"adv X ago"-Debug-Info entfernt** — war unklar für Nicht-Entwickler
+- **Shutter-Button redesigned** — immer sichtbar an fester Position, großer weißer Kreis (Kamera-Auslöser-Look), ausgegraut wenn nicht connected
+- **Battery-Opt- und Background-Location-Warnungen** aus der Tracking-Card entfernt — beides wird im Onboarding-Flow abgedeckt
+- **Alle Screens scrollbar** — `verticalScroll` auf PermissionFlow, DevicePicker und MainScreen gegen Abschneiden bei kleinen Displays oder großer Schrift
+
+### Review-Runde (6 unabhängige Agenten)
+
+Drei Claude-Subagenten (Reuse / Quality / Efficiency) plus drei Codex-Agenten (ebenfalls Reuse / Quality / Efficiency) über MCP. Neun Findings gefixt:
+
+1. **`hasAllPerms` duplizierte Permission-Liste aus `permGroups`** — abgeleitet statt dupliziert (5 Agenten)
+2. **`resolveSelectedDevice` hatte Side-Effect im Router** — Schreib-Logik explizit vor Screen-Bestimmung (4 Agenten)
+3. **Dead `refreshKey` in DevicePicker** — entfernt (3 Agenten)
+4. **Doppelte `onDone()`-Pfade in PermissionFlow** — redundanten `LaunchedEffect` entfernt (2 Agenten)
+5. **Misalignment bei isSelected-Indicator** — immer Platzhalter rendern (1 Agent)
+6. **Unnötiger innerer Column im MainScreen-Header** — entfernt (1 Agent)
+7. **Bug: FgScanner startete nicht nach Picker-Roundtrip** — `FgScanner.start(ctx)` im `onBack`-Handler (1 Codex-Agent)
+8. **BootReceiver fand bei Cold-Start keine Kamera** — `resolveSelectedDevice` vor `register()` (1 Codex-Agent)
+9. **Kein Scroll auf PermissionFlow/DevicePicker/MainScreen** — `verticalScroll` ergänzt (1 Codex-Agent)
+
+### Stand nach Phase 10
+
+Die App ist jetzt für andere Nutzer benutzbar: sauberer Onboarding-Flow, jede Permission erklärt, Kamera-Auswahl mit Auto-Select und manuellem Wechsel, Tracking standardmäßig an. Technisch: Screen-State-Machine re-evaluiert bei jedem Resume, eine einzige Quelle der Wahrheit für Permission-Gruppen, persistierte MAC-Auswahl über alle Scan/Service-Pfade konsistent.
+
+*Letzte Aktualisierung: 2026-04-19*

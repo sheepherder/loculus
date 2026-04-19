@@ -16,6 +16,7 @@ import android.content.SharedPreferences
 object Prefs {
     private const val NAME = "eos_gps_prefs"
     private const val KEY_TRACKING = "tracking_enabled"
+    private const val KEY_DEVICE_MAC = "selected_device_mac"
     private const val LEGACY_KEY_AUTO_START = "auto_start_enabled"
 
     private fun prefs(ctx: Context): SharedPreferences =
@@ -28,10 +29,17 @@ object Prefs {
             p.edit().putBoolean(KEY_TRACKING, legacy).remove(LEGACY_KEY_AUTO_START).apply()
             return legacy
         }
-        return p.getBoolean(KEY_TRACKING, false)
+        return p.getBoolean(KEY_TRACKING, true)
     }
 
     fun setTrackingEnabled(ctx: Context, value: Boolean) {
         prefs(ctx).edit().putBoolean(KEY_TRACKING, value).apply()
+    }
+
+    fun selectedDeviceMac(ctx: Context): String? =
+        prefs(ctx).getString(KEY_DEVICE_MAC, null)
+
+    fun setSelectedDeviceMac(ctx: Context, mac: String?) {
+        prefs(ctx).edit().putString(KEY_DEVICE_MAC, mac).apply()
     }
 }

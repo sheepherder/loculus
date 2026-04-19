@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`): wenn an, läuft die App passiv und streamt GPS, sobald die Kamera sich einschaltet. Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
+**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
 
-**Datum:** 2026-04-18
+**Datum:** 2026-04-19
 
 ---
 
@@ -279,8 +279,10 @@ pip install bleak
 
 Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung zwischen Pixel und Canon. **Ein-Schalter-Architektur** (`trackingEnabled`) mit strikter Scanner-Ownership: zu jedem Zeitpunkt höchstens ein aktiver Scan-Owner, der FGS existiert ausschließlich während einer GATT-Session.
 
-**Status (2026-04-18):**
-- Ein User-Schalter "Tracking on/off" (Prefs `trackingEnabled`, Migration aus altem `auto_start_enabled`): ✅
+**Status (2026-04-19):**
+- Onboarding-Flow: sequenzielle Permission-Screens (Bluetooth → Standort → Hintergrund-Standort → Benachrichtigungen → Akku-Optimierung) mit Erklärungstext, bei jedem App-Start re-gecheckt: ✅
+- Kamera-Auswahl: Auto-Select bei 1 gebondeter EOS, Picker bei 0 oder 2+, MAC persistiert in Prefs, aus Main-Screen wechselbar: ✅
+- Ein User-Schalter "Tracking on/off" (Prefs `trackingEnabled`, Default: an, Migration aus altem `auto_start_enabled`): ✅
 - Activity-owned Live-Scanner (`FgScanner`) bei sichtbarer Activity, HW-Filter Canon-Company-ID: ✅
 - OS-offloaded PendingIntent-Scan (`CanonScanRegistrar`) bei unsichtbarer Activity + Schalter on, HW-Filter zusätzlich byte5-low3=010 (awake): ✅
 - Foreground Service (`GpsTrackingService`) nur während GATT-Session (connect → stream → disconnect → exit), keine eigenen Scanner mehr: ✅
@@ -297,7 +299,7 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 - UI-seitige Ad-Staleness-Derivation (> 8 s ohne Ad + `connState=IDLE` → `UNSEEN`), kein Watchdog-Timer: ✅
 - OS-Scan-Rearm (`unregister`+`register`) bei FGS-Teardown wenn Activity unsichtbar: ✅
 - Lifecycle-gebundener Compose-Ticker (`repeatOnLifecycle(STARTED)`), kein Dauer-Wake im Hintergrund: ✅
-- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Tracking-Switch, Battery-Opt- und Background-Location-Prompts: ✅
+- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Tracking-Switch, Shutter-Button (Kamera-Auslöser-Look, immer sichtbar): ✅
 - EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert: ✅
 
 **Architekturübersicht:**
@@ -372,27 +374,27 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 ```
 android/app/src/main/java/de/schaefer/eosgps/
-├── MainActivity.kt         Compose UI, Lifecycle-gebundener Scanner + Ticker, Tracking-Switch
+├── MainActivity.kt         Screen-Router (Permission/Picker/Main), Onboarding, Device-Picker, Compose UI
 ├── GpsTrackingService.kt   FGS nur während GATT-Session (~270 Zeilen, kein Scan, keine Watchdogs)
 ├── FgScanner.kt            Activity-owned Live-Scanner, 20-min Restart, HW-Filter MAC+CompanyID
-├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff (unverändert)
-├── CanonGpsFrame.kt        20-Byte-Binär-Encoder (unverändert)
+├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff, Shutter-Trigger
+├── CanonGpsFrame.kt        20-Byte-Binär-Encoder
 ├── CanonAd.kt              Scan-Konstanten + powerStateFromByte() (single source of truth)
 ├── CanonScanRegistrar.kt   OS-Scan via PendingIntent, HW-Filter inkl. byte5-awake
 ├── ScanResultReceiver.kt   Broadcast-Receiver mit Prefs-Hard-Gate
-├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm wenn trackingEnabled
-├── Bluetooth.kt            findBondedCanon + readyScanner + hasBluetoothPermissions + hasBackgroundLocation
-├── Prefs.kt                SharedPreferences mit Migration autoStartEnabled → trackingEnabled
+├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm + Auto-Select
+├── Bluetooth.kt            findSelectedDevice + findAllBondedCanon + resolveSelectedDevice + readyScanner
+├── Prefs.kt                SharedPreferences: trackingEnabled + selectedDeviceMac
 └── TrackingState.kt        StateFlows + `appVisible: Boolean` (Service ↔ UI)
 ```
 
 **Bewusst nicht implementiert / offene TODOs:**
-- [ ] Fernauslöser (`00030001` Write) — eigene Crash-Oberfläche, separates Feature
+- [x] Fernauslöser — Shutter-Button (AF_REL_ON/OFF auf `00030030`), immer sichtbar, disabled wenn nicht connected
+- [x] Setup-Flow / Onboarding — sequenzielle Permission-Screens + Kamera-Auswahl mit Picker
 - [ ] Batterie / Shutter-Counter — nur via PTP-IP über WiFi, BLE liefert das nicht
 - [ ] `{2}`-Path testen (frisch reset'd Kamera) — defensive Logik im Code, ungetestet
 - [ ] DIS-Reads — bräuchte SMP-Key-Installation, HCI 0x3D Disconnect bei Encryption-Escalation
 - [ ] Speed/Bearing im GPS-Frame — Canon speichert das nur lokal, nicht im 20-Byte-BLE-Format
-- [ ] Setup-Flow / Multi-Camera — siehe `IDEEN_FUER_SPAETER.md`
 
 ---
 
@@ -474,4 +476,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-04-18*
+*Letzte Aktualisierung: 2026-04-19*

@@ -118,7 +118,7 @@ class GpsTrackingService : Service() {
         TrackingState.serviceRunning.value = true
         TrackingState.resetSession()
 
-        val device = findBondedCanon(this)
+        val device = findSelectedDevice(this)
         if (device == null) {
             Log.w(TAG, "no bonded EOS device found")
             stopSelf()

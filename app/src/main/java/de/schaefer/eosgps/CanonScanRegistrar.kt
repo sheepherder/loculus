@@ -29,7 +29,7 @@ object CanonScanRegistrar {
             Log.w(TAG, "register: scanner preflight failed")
             return false
         }
-        val target = findBondedCanon(ctx) ?: run {
+        val target = findSelectedDevice(ctx) ?: run {
             Log.w(TAG, "register: no bonded EOS device found")
             return false
         }

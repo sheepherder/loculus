@@ -20,8 +20,7 @@ class BootReceiver : BroadcastReceiver() {
             Log.i(TAG, "tracking disabled; no-op")
             return
         }
-        // Registration is cheap; always re-register on these events rather
-        // than trusting whatever state we held before reboot.
+        resolveSelectedDevice(ctx)
         val ok = CanonScanRegistrar.register(ctx)
         Log.i(TAG, "re-armed scan: $ok")
     }

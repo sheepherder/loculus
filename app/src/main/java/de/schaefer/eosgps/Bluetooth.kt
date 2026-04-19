@@ -11,15 +11,33 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 
 @SuppressLint("MissingPermission")
-fun findBondedCanon(ctx: Context): BluetoothDevice? {
-    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT)
-        != PackageManager.PERMISSION_GRANTED) return null
+fun findSelectedDevice(ctx: Context): BluetoothDevice? {
+    val mac = Prefs.selectedDeviceMac(ctx) ?: return null
+    if (!hasBluetoothPermissions(ctx)) return null
     val adapter = bluetoothAdapter(ctx) ?: return null
     return try {
-        adapter.bondedDevices.firstOrNull { (it.name ?: "").contains("EOS", true) }
-    } catch (_: SecurityException) {
-        null
+        adapter.bondedDevices.firstOrNull { it.address == mac }
+    } catch (_: SecurityException) { null }
+}
+
+@SuppressLint("MissingPermission")
+fun findAllBondedCanon(ctx: Context): List<BluetoothDevice> {
+    if (!hasBluetoothPermissions(ctx)) return emptyList()
+    val adapter = bluetoothAdapter(ctx) ?: return emptyList()
+    return try {
+        adapter.bondedDevices.filter { (it.name ?: "").contains("EOS", true) }
+    } catch (_: SecurityException) { emptyList() }
+}
+
+@SuppressLint("MissingPermission")
+fun resolveSelectedDevice(ctx: Context): BluetoothDevice? {
+    findSelectedDevice(ctx)?.let { return it }
+    val all = findAllBondedCanon(ctx)
+    if (all.size == 1) {
+        Prefs.setSelectedDeviceMac(ctx, all[0].address)
+        return all[0]
     }
+    return null
 }
 
 /**
