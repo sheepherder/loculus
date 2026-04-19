@@ -49,20 +49,13 @@ class GpsTrackingService : Service() {
 
     private var gatt: CanonGattClient? = null
     private var bondedDevice: BluetoothDevice? = null
-    private val fused by lazy { LocationServices.getFusedLocationProviderClient(this) }
+    private val fused by lazy { LocationServices.getFusedLocationProviderClient(applicationContext) }
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val rssiPollRunnable = object : Runnable {
         override fun run() {
             gatt?.readRssi()
             mainHandler.postDelayed(this, RSSI_POLL_INTERVAL_MS)
-        }
-    }
-
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            val loc = result.lastLocation ?: return
-            onLocation(loc)
         }
     }
 
@@ -136,6 +129,7 @@ class GpsTrackingService : Service() {
         TrackingState.cameraPower.value = CameraPowerState.POWER_ON
         TrackingState.lastAdvertAt.value = SystemClock.elapsedRealtime()
 
+        activeService = this
         startLocationUpdates()
         startGattSession()
     }
@@ -144,6 +138,7 @@ class GpsTrackingService : Service() {
         Log.i(TAG, "stopTracking")
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
+        activeService = null
         gatt?.stopAndDisconnect()
         gatt = null
         bondedDevice = null
@@ -157,6 +152,7 @@ class GpsTrackingService : Service() {
     override fun onDestroy() {
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
+        if (activeService === this) activeService = null
         gatt?.stopAndDisconnect()
         gatt = null
         TrackingState.serviceRunning.value = false
@@ -203,15 +199,10 @@ class GpsTrackingService : Service() {
         mainHandler.postDelayed(rssiPollRunnable, RSSI_POLL_INTERVAL_MS)
     }
 
-    /**
-     * GATT dropped — camera went to standby, out of range, battery pull,
-     * main switch off, etc. No grace window: we exit the service, and let
-     * whichever scanner is appropriate (FgScanner in the foreground,
-     * CanonScanRegistrar in the background) trigger us again when the next
-     * POWER_ON ad arrives.
-     */
     private fun onGattDisconnected() {
         mainHandler.removeCallbacks(rssiPollRunnable)
+        val status = gatt?.lastDisconnectStatus ?: 0
+        Log.i(TAG, "GATT disconnected status=0x${status.toString(16)}")
         gatt = null
         TrackingState.rssi.value = null
         TrackingState.sessionStartedAt.value = null
@@ -302,6 +293,19 @@ class GpsTrackingService : Service() {
     companion object {
         const val ACTION_STOP = "de.schaefer.eosgps.STOP"
         const val ACTION_SHUTTER = "de.schaefer.eosgps.SHUTTER"
+
+        @Volatile
+        private var activeService: GpsTrackingService? = null
+
+        private val locationCallback = object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                val svc = activeService ?: return
+                Log.i(TAG, "onLocationResult: ${result.locations.size} locs, " +
+                        "cb=${hashCode()}, thread=${Thread.currentThread().name}")
+                val loc = result.lastLocation ?: return
+                svc.onLocation(loc)
+            }
+        }
 
         fun start(ctx: Context) {
             val i = Intent(ctx, GpsTrackingService::class.java)
