@@ -16,7 +16,9 @@
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
-        android:label="EOS GPS"
+        android:label="Loculus"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@style/Theme.EosGps"
         android:allowBackup="false">
 
