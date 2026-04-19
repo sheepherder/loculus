@@ -1,5 +1,7 @@
 package de.schaefer.eosgps
 
+import android.bluetooth.le.ScanFilter
+
 /**
  * Canon advertisement decoding — single source of truth for both the
  * Activity-owned live scan ([FgScanner]) and the OS-offloaded scan
@@ -30,6 +32,16 @@ object CanonAd {
      * change" and keeps the previous state; we propagate that by letting
      * the caller skip the update.
      */
+    fun scanFilter(mac: String, awakeOnly: Boolean): ScanFilter =
+        ScanFilter.Builder()
+            .setDeviceAddress(mac)
+            .setManufacturerData(
+                COMPANY_ID,
+                if (awakeOnly) AWAKE_MFG_DATA else ByteArray(0),
+                if (awakeOnly) AWAKE_MFG_MASK else ByteArray(0),
+            )
+            .build()
+
     fun powerStateFromByte(b: Byte): CameraPowerState? = when ((b.toInt() shr 1) and 0x03) {
         0 -> CameraPowerState.AUTO_POWER_OFF
         1 -> CameraPowerState.POWER_ON

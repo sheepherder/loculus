@@ -135,6 +135,8 @@ class GpsTrackingService : Service() {
     }
 
     private fun stopTracking() {
+        if (!TrackingState.serviceRunning.value) return
+        TrackingState.serviceRunning.value = false
         Log.i(TAG, "stopTracking")
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
@@ -142,7 +144,6 @@ class GpsTrackingService : Service() {
         gatt?.stopAndDisconnect()
         gatt = null
         bondedDevice = null
-        TrackingState.serviceRunning.value = false
         TrackingState.connState.value = ConnState.IDLE
         TrackingState.gpsState.value = CanonGpsState.UNKNOWN
         stopForeground(STOP_FOREGROUND_REMOVE)

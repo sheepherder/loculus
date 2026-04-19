@@ -2,7 +2,6 @@ package de.schaefer.eosgps
 
 import android.annotation.SuppressLint
 import android.app.PendingIntent
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
@@ -34,10 +33,7 @@ object CanonScanRegistrar {
             return false
         }
 
-        val filter = ScanFilter.Builder()
-            .setDeviceAddress(target.address)
-            .setManufacturerData(CanonAd.COMPANY_ID, CanonAd.AWAKE_MFG_DATA, CanonAd.AWAKE_MFG_MASK)
-            .build()
+        val filter = CanonAd.scanFilter(target.address, awakeOnly = true)
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)

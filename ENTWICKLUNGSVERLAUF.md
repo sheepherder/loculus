@@ -751,4 +751,72 @@ Drei Claude-Subagenten (Reuse / Quality / Efficiency) plus drei Codex-Agenten (e
 
 Die App ist jetzt für andere Nutzer benutzbar: sauberer Onboarding-Flow, jede Permission erklärt, Kamera-Auswahl mit Auto-Select und manuellem Wechsel, Tracking standardmäßig an. Technisch: Screen-State-Machine re-evaluiert bei jedem Resume, eine einzige Quelle der Wahrheit für Permission-Gruppen, persistierte MAC-Auswahl über alle Scan/Service-Pfade konsistent.
 
+---
+
+## Phase 11 — Code-Review + Refactoring (19. April 2026)
+
+### Auslöser
+
+Umfassendes Code-Review der gesamten App: 4 spezialisierte Claude-Agenten (SOLID/DRY/KISS/YAGNI, Bug/Race-Conditions, Android-spezifisch, Code-Qualität) plus 3 Codex-Agenten (MCP). 22 Findings konsolidiert, 19 davon gefixt in 13 Tasks.
+
+### GATT-State-Machine-Fixes (HIGH)
+
+**Doppelter `stopTracking()`-Aufruf:** `stopTracking()` → `gatt?.stopAndDisconnect()` startete eine asynchrone GATT-Teardown-Sequenz, deren Disconnect-Callback erneut `stopTracking()` aufrief. Fix: Guard via `TrackingState.serviceRunning.value` als erstes Statement in `stopTracking()`.
+
+**NO_RESPONSE double-complete:** `pump()` markierte GPS-Writes (WRITE_TYPE_NO_RESPONSE) als sofort fertig und pumpte den nächsten Op, aber Android feuerte trotzdem `onCharacteristicWrite`. Ein später Callback konnte `opInFlight` fälschlich auf `false` setzen und im STOPPING-State einen vorzeitigen Disconnect auslösen. Fix: Zähler `noResponseSelfCompleted`, den `onCharacteristicWrite` dekrementiert und dann skippt.
+
+**Kein Timeout für REQUESTING_GPS:** Wenn der Kickoff erfolgte aber die Ready-Indication nie kam, blieb die Connection ewig in REQUESTING_GPS. Fix: `Handler.postDelayed`-Timeout: 10s für REQUESTING_GPS, 5s für STOPPING. Cancelled bei erfolgreicher State-Transition oder Disconnect.
+
+**`onConnectionStateChange` ignorierte Status:** Ein `STATE_CONNECTED` mit non-success `status` wurde als erfolgreich behandelt. Fix: `status != GATT_SUCCESS` → `g.close()` + `state = IDLE`.
+
+**Write-Dispatch-Failure im STOPPING-State:** Wenn der Stop-GPS-Write fehlschlug und die Queue leer war, blieb `state` auf STOPPING. Fix: In `pump()` bei Dispatch-Failure + STOPPING + leere Queue → sofort `doDisconnect()`.
+
+### Lifecycle-Fixes (MEDIUM)
+
+**FgScanner nicht gestartet nach Screen-Wechsel:** Beim Übergang von Permission/DevicePicker zu MainScreen startete FgScanner nicht, weil ON_RESUME schon gefeuert hatte. Fix: `DisposableEffect`-Body prüft beim Setup ob Lifecycle bereits RESUMED ist und führt die Scanner-Logik sofort aus.
+
+**`resolveSelectedDevice()` im Composable-Body:** Side-Effect (Prefs-Write) bei jeder Recomposition. Fix: In `remember { ... }` Block verschoben — wird nur bei erster Komposition ausgeführt.
+
+**Permission-Checks bei jedem Recompose:** `groups.filter { !it.isGranted(ctx) }` rief `checkSelfPermission` bei jeder Recomposition. Fix: `remember(refreshKey) { ... }`.
+
+### Security-Hardening (LOW)
+
+**BootReceiver:** Akzeptierte beliebige Broadcast-Actions (exported receiver). Fix: Action-Filter auf `BOOT_COMPLETED` und `MY_PACKAGE_REPLACED`.
+
+**ScanResultReceiver:** Ein verspäteter PendingIntent von einer alten Registrierung konnte den Service für die falsche Kamera starten. Fix: MAC-Check gegen `Prefs.selectedDeviceMac`.
+
+### Code-Organisation
+
+**MainActivity.kt aufgeteilt:** 779 Zeilen → 4 Dateien:
+- `MainActivity.kt` (~100 Z.) — Activity + Screen-Router
+- `MainScreen.kt` (~390 Z.) — Hauptbildschirm + UI-Composables + Farb/Format-Helfer
+- `PermissionFlow.kt` (~200 Z.) — Onboarding-Flow + Permission-Gruppen
+- `DevicePicker.kt` (~150 Z.) — Kamera-Auswahl
+
+Visibility: `private` → `internal` für cross-file Composables/Funktionen.
+
+### DRY / Cleanup
+
+- **Scan-Filter-Builder extrahiert:** `CanonAd.scanFilter(mac, awakeOnly)` — gemeinsam genutzt von `FgScanner` und `CanonScanRegistrar`
+- **Tote UUID-Konstanten entfernt:** `PAIRING_REQUEST`, `PAIRING_RESPONSE`, `HANDOVER_STATE`
+- **`log()`-Wrapper entfernt:** Alle Aufrufe durch direktes `Log.i(TAG, ...)` ersetzt
+- **UI-Labels auf Deutsch vereinheitlicht:** „Connection" → „Verbindung", „GPS Session" → „GPS-Sitzung", „CAMERA" → „KAMERA", Key-Value-Labels großgeschrieben
+- **`@SuppressLint("MissingPermission")`** in FgScanner von Klassen- auf Methodenebene verschoben
+- **`findAllBondedCanon` robuster:** Filtert jetzt auf `"EOS"` oder `"Canon"` im BT-Namen, plus bereits konfigurierte Kamera (via `selectedDeviceMac`) wird immer einbezogen
+
+### Tests + Build
+
+- **11 Unit-Tests** für `CanonGpsFrame.encode()`: N/S/E/W-Bits, Float-LE-Encoding, NaN-Altitude, Referenzframe (Berlin Brandenburger Tor). Neues Testverzeichnis `src/test/`, JUnit 4.13.2 als Dependency.
+- **`proguard-rules.pro` vorbereitet:** Keep-Regeln für Manifest-Komponenten, BLE-Callbacks, Play Services. `isMinifyEnabled` bleibt `false` (kein R8 ohne Testsuite).
+
+### Nicht gefixt (mit Begründung)
+
+- `trackingEnabled` Default `true` — bewusste Design-Entscheidung, dokumentiert
+- Keine `@Preview`-Funktionen — Aufwand/Nutzen für Ein-Personen-Projekt zu gering
+- R8 nicht aktiviert — ohne vollständige Testsuite riskant
+
+### Stand nach Phase 11
+
+Codebasis ist jetzt sauber strukturiert (15 Dateien statt monolithischer MainActivity), GATT-State-Machine ist robust gegen Hänger und Doppel-Teardowns, Security-Basics sind abgedeckt, und der GPS-Frame-Encoder hat eine verifizierte Testsuite. Alle 22 Review-Findings sind bearbeitet (19 gefixt, 3 bewusst nicht gefixt mit Begründung).
+
 *Letzte Aktualisierung: 2026-04-19*

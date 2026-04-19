@@ -9,6 +9,8 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import java.util.ArrayDeque
 import java.util.UUID
@@ -28,16 +30,13 @@ object CanonUuids {
     // write Canon's firmware never sends the ready signal and any GPS frames
     // we push end up waking the camera's GPS subsystem in an ill-defined state.
     val PAIRING_SERVICE: UUID = UUID.fromString("00010000-0000-1000-0000-d8492fffa821")
-    val PAIRING_REQUEST: UUID = UUID.fromString("00010005-0000-1000-0000-d8492fffa821")
     val PAIRING_DATA: UUID = UUID.fromString("0001000a-0000-1000-0000-d8492fffa821")
-    val PAIRING_RESPONSE: UUID = UUID.fromString("0001000b-0000-1000-0000-d8492fffa821")
 
     // BLE→WiFi handover service (0x00020000). Canon writes 0x0a to HANDOVER_DATA
     // right after CCCDs are enabled — it's part of the kickoff that precedes the
     // pairing-0x01 write. We subscribe its notify/indicate channels to mirror
     // Canon exactly even though we never actually initiate a WiFi handover.
     val HANDOVER_SERVICE: UUID = UUID.fromString("00020000-0000-1000-0000-d8492fffa821")
-    val HANDOVER_STATE: UUID = UUID.fromString("00020001-0000-1000-0000-d8492fffa821")
     val HANDOVER_DATA: UUID = UUID.fromString("00020002-0000-1000-0000-d8492fffa821")
     val HANDOVER_NOTIFY: UUID = UUID.fromString("00020003-0000-1000-0000-d8492fffa821")
 
@@ -131,6 +130,22 @@ class CanonGattClient(
 
     private val opQueue = ArrayDeque<GattOp>()
     @Volatile private var opInFlight = false
+    private var noResponseSelfCompleted = 0
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val stateTimeout = Runnable {
+        when (state) {
+            ConnState.REQUESTING_GPS -> {
+                Log.w(TAG, "REQUESTING_GPS timeout (10s) — disconnecting")
+                doDisconnect()
+            }
+            ConnState.STOPPING -> {
+                Log.w(TAG, "STOPPING timeout (5s) — forcing disconnect")
+                doDisconnect()
+            }
+            else -> {}
+        }
+    }
 
     @Volatile var state: ConnState = ConnState.IDLE
         private set(value) {
@@ -146,15 +161,11 @@ class CanonGattClient(
             onGpsState(value)
         }
 
-    private fun log(msg: String) {
-        Log.i(TAG, msg)
-    }
-
     // --- Public API ---
 
     fun connect(device: BluetoothDevice) {
-        if (state != ConnState.IDLE) { log("connect ignored, state=$state"); return }
-        log("connect ${device.address}")
+        if (state != ConnState.IDLE) { Log.i(TAG,"connect ignored, state=$state"); return }
+        Log.i(TAG,"connect ${device.address}")
         state = ConnState.CONNECTING
         gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
     }
@@ -170,7 +181,7 @@ class CanonGattClient(
     fun triggerShutter(): Boolean {
         val ch = shutterChar ?: return false
         if (gpsState != CanonGpsState.READY_TO_RECEIVE) {
-            log("triggerShutter rejected, gpsState=$gpsState"); return false
+            Log.i(TAG,"triggerShutter rejected, gpsState=$gpsState"); return false
         }
         enqueue(GattOp.Write(ch, byteArrayOf(0x00, 0x01), "AF_REL_ON",
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
@@ -186,7 +197,7 @@ class CanonGattClient(
      */
     fun sendGps(latitude: Double, longitude: Double, altitude: Double, unixSeconds: Long): Boolean {
         if (gpsState != CanonGpsState.READY_TO_RECEIVE) {
-            log("sendGps rejected, gpsState=$gpsState")
+            Log.i(TAG,"sendGps rejected, gpsState=$gpsState")
             return false
         }
         val ch = dataChar ?: return false
@@ -210,6 +221,8 @@ class CanonGattClient(
             state = ConnState.STOPPING
             enqueue(GattOp.Write(ch, byteArrayOf(0x03), "stop GPS",
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
+            handler.removeCallbacks(stateTimeout)
+            handler.postDelayed(stateTimeout, 5_000L)
         } else {
             doDisconnect()
         }
@@ -238,9 +251,10 @@ class CanonGattClient(
             opInFlight = true
             val ok = when (op) {
                 is GattOp.Write -> {
-                    log("→ write ${op.label} (${op.data.size}B, type=${op.writeType})")
+                    Log.i(TAG,"→ write ${op.label} (${op.data.size}B, type=${op.writeType})")
                     val success = writeChar(g, op.ch, op.data, op.writeType)
                     if (op.writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE && success) {
+                        noResponseSelfCompleted++
                         opInFlight = false
                         pump()
                         return
@@ -248,17 +262,21 @@ class CanonGattClient(
                     success
                 }
                 is GattOp.WriteDesc -> {
-                    log("→ write descriptor ${op.label}")
+                    Log.i(TAG,"→ write descriptor ${op.label}")
                     writeDesc(g, op.desc, op.data)
                 }
                 is GattOp.Read -> {
-                    log("→ read ${op.label}")
+                    Log.i(TAG,"→ read ${op.label}")
                     g.readCharacteristic(op.ch)
                 }
             }
             if (!ok) {
-                log("op dispatch returned false, advancing")
+                Log.i(TAG,"op dispatch returned false, advancing")
                 opInFlight = false
+                if (state == ConnState.STOPPING && opQueue.isEmpty()) {
+                    doDisconnect()
+                    return
+                }
                 pump()
             }
         }
@@ -297,13 +315,21 @@ class CanonGattClient(
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-            log("onConnectionStateChange status=0x${status.toString(16)} newState=$newState")
+            Log.i(TAG,"onConnectionStateChange status=0x${status.toString(16)} newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.i(TAG,"connect failed status=0x${status.toString(16)}, closing")
+                    g.close()
+                    if (gatt === g) gatt = null
+                    state = ConnState.IDLE
+                    return
+                }
                 state = ConnState.DISCOVERING
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                handler.removeCallbacks(stateTimeout)
                 lastDisconnectStatus = status
-                synchronized(opQueue) { opQueue.clear(); opInFlight = false }
+                synchronized(opQueue) { opQueue.clear(); opInFlight = false; noResponseSelfCompleted = 0 }
                 g.close()
                 if (gatt === g) gatt = null
                 statusChar = null; dataChar = null; notifyChar = null
@@ -316,18 +342,18 @@ class CanonGattClient(
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            log("onServicesDiscovered status=$status")
+            Log.i(TAG,"onServicesDiscovered status=$status")
             if (status != BluetoothGatt.GATT_SUCCESS) { doDisconnect(); return }
             val gpsSvc = g.getService(CanonUuids.GPS_SERVICE)
             if (gpsSvc == null) {
-                log("GPS service not found")
+                Log.i(TAG,"GPS service not found")
                 doDisconnect(); return
             }
             statusChar = gpsSvc.getCharacteristic(CanonUuids.GPS_STATUS)
             dataChar = gpsSvc.getCharacteristic(CanonUuids.GPS_DATA)
             notifyChar = gpsSvc.getCharacteristic(CanonUuids.GPS_NOTIFY)
             if (dataChar == null || notifyChar == null) {
-                log("missing GPS chars"); doDisconnect(); return
+                Log.i(TAG,"missing GPS chars"); doDisconnect(); return
             }
             pairingDataChar = g.getService(CanonUuids.PAIRING_SERVICE)
                 ?.getCharacteristic(CanonUuids.PAIRING_DATA)
@@ -384,15 +410,15 @@ class CanonGattClient(
             cccdValue: ByteArray,
         ) {
             if (!g.setCharacteristicNotification(ch, true)) {
-                log("setCharacteristicNotification($label) returned false"); return
+                Log.i(TAG,"setCharacteristicNotification($label) returned false"); return
             }
             val desc = ch.getDescriptor(CanonUuids.CCCD)
-            if (desc == null) { log("CCCD missing on $label"); return }
+            if (desc == null) { Log.i(TAG,"CCCD missing on $label"); return }
             enqueue(GattOp.WriteDesc(desc, cccdValue, "CCCD $label"))
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            log("onDescriptorWrite ${shortUuid(descriptor.characteristic.uuid)} status=$status")
+            Log.i(TAG,"onDescriptorWrite ${shortUuid(descriptor.characteristic.uuid)} status=$status")
             opCompleted()
             if (state == ConnState.SUBSCRIBING) {
                 synchronized(opQueue) {
@@ -410,7 +436,7 @@ class CanonGattClient(
          * icon on camera stays grey/off).
          */
         private fun fireCanonKickoff() {
-            log("→ Canon kickoff (handover 0x0a / source query / pairing 0x01)")
+            Log.i(TAG,"→ Canon kickoff (handover 0x0a / source query / pairing 0x01)")
             handoverDataChar?.let {
                 enqueue(GattOp.Write(it, byteArrayOf(0x0a), "handover 0a",
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
@@ -426,10 +452,12 @@ class CanonGattClient(
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
             }
             state = ConnState.REQUESTING_GPS
+            handler.removeCallbacks(stateTimeout)
+            handler.postDelayed(stateTimeout, 10_000L)
         }
 
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
-            log("onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${value.toHexCompact()}")
+            Log.i(TAG,"onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${value.toHexCompact()}")
             opCompleted()
             if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, value)
         }
@@ -438,7 +466,7 @@ class CanonGattClient(
         override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
             @Suppress("DEPRECATION")
             val v = ch.value ?: ByteArray(0)
-            log("onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${v.toHexCompact()}")
+            Log.i(TAG,"onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${v.toHexCompact()}")
             opCompleted()
             if (status == BluetoothGatt.GATT_SUCCESS) routeRead(ch, v)
         }
@@ -452,17 +480,23 @@ class CanonGattClient(
             // doesn't re-indicate after the kickoff.
             if (ch.uuid == CanonUuids.GPS_NOTIFY && value.isNotEmpty()) {
                 initialNotifyByte = value[0].toInt() and 0xff
-                log("  initial NOTIFY byte0=0x${"%02x".format(initialNotifyByte)}")
+                Log.i(TAG,"  initial NOTIFY byte0=0x${"%02x".format(initialNotifyByte)}")
             }
             if (ch.uuid == CanonUuids.GPS_STATUS && value.isNotEmpty()) {
                 val b = value[0].toInt()
-                log("  STATUS byte0=0x${"%02x".format(b)} bit1(active)=${(b and 2) != 0}")
+                Log.i(TAG,"  STATUS byte0=0x${"%02x".format(b)} bit1(active)=${(b and 2) != 0}")
             }
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            log("onCharacteristicWrite ${shortUuid(ch.uuid)} status=$status")
+            Log.i(TAG,"onCharacteristicWrite ${shortUuid(ch.uuid)} status=$status")
             onWriteResult(status)
+            synchronized(opQueue) {
+                if (noResponseSelfCompleted > 0) {
+                    noResponseSelfCompleted--
+                    return
+                }
+            }
             opCompleted()
             if (state == ConnState.STOPPING) {
                 synchronized(opQueue) {
@@ -478,7 +512,8 @@ class CanonGattClient(
                 && status == BluetoothGatt.GATT_SUCCESS) {
                 synchronized(opQueue) {
                     if (opQueue.isEmpty() && !opInFlight && initialNotifyByte == 2) {
-                        log("kickoff done, no fresh indication but initial NOTIFY=2 → assume ready")
+                        Log.i(TAG,"kickoff done, no fresh indication but initial NOTIFY=2 → assume ready")
+                        handler.removeCallbacks(stateTimeout)
                         gpsState = CanonGpsState.READY_TO_RECEIVE
                         state = ConnState.GPS_SESSION_ACTIVE
                     }
@@ -491,7 +526,7 @@ class CanonGattClient(
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-            log("NOTIFY ${shortUuid(ch.uuid)} ${value.toHexCompact()}")
+            Log.i(TAG,"NOTIFY ${shortUuid(ch.uuid)} ${value.toHexCompact()}")
             handleStateByte(ch, value)
         }
 
@@ -499,7 +534,7 @@ class CanonGattClient(
         override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
             @Suppress("DEPRECATION")
             val v = ch.value ?: return
-            log("NOTIFY ${shortUuid(ch.uuid)} ${v.toHexCompact()}")
+            Log.i(TAG,"NOTIFY ${shortUuid(ch.uuid)} ${v.toHexCompact()}")
             handleStateByte(ch, v)
         }
 
@@ -518,12 +553,15 @@ class CanonGattClient(
                 1 -> gpsState = CanonGpsState.STATE_1
                 2 -> {
                     gpsState = CanonGpsState.READY_TO_RECEIVE
-                    if (state == ConnState.REQUESTING_GPS) state = ConnState.GPS_SESSION_ACTIVE
+                    if (state == ConnState.REQUESTING_GPS) {
+                        handler.removeCallbacks(stateTimeout)
+                        state = ConnState.GPS_SESSION_ACTIVE
+                    }
                 }
                 3 -> gpsState = CanonGpsState.STATE_3
                 5 -> {
                     val src = if (value.size >= 2) value[1].toInt() else -1
-                    log("  camera GPS source = $src (${gpsSourceName(src)})")
+                    Log.i(TAG,"  camera GPS source = $src (${gpsSourceName(src)})")
                 }
             }
         }

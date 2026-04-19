@@ -6,7 +6,7 @@
 
 **Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
 
-**Datum:** 2026-04-19
+**Datum:** 2026-04-19 (Phase 11: Code-Review + Refactoring)
 
 ---
 
@@ -359,7 +359,7 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 | OS-Scan (BG)     | MAC + Canon mfg id `0x01A9` + byte5 awake   | —                     |
 | FgScanner (FG)   | MAC + Canon mfg id `0x01A9`                 | byte5 → Power-State   |
 
-OS-Scan-Stage wird nur auf echte Wake-Events aufgeweckt; der PendingIntent-Broadcast liefert ohnehin einen verschlankten `ScanResult` (oft `rssi=0`, `scanRecord=null`), dem HW-Filter wird vertraut. FgScanner sieht alle Power-States live — das Decoding findet in `CanonAd.powerStateFromByte()` statt (single source of truth in `CanonAd.kt`). Preflight-Duplikat (Permission + Adapter + Scanner-Resolution) wurde in `Bluetooth.readyScanner()` extrahiert.
+OS-Scan-Stage wird nur auf echte Wake-Events aufgeweckt; der PendingIntent-Broadcast liefert ohnehin einen verschlankten `ScanResult` (oft `rssi=0`, `scanRecord=null`), dem HW-Filter wird vertraut. `ScanResultReceiver` prüft zusätzlich die MAC gegen `Prefs.selectedDeviceMac` (Phase 11). FgScanner sieht alle Power-States live — das Decoding findet in `CanonAd.powerStateFromByte()` statt (single source of truth in `CanonAd.kt`). Scan-Filter-Konstruktion wurde in `CanonAd.scanFilter(mac, awakeOnly)` extrahiert (Phase 11). Preflight (Permission + Adapter + Scanner-Resolution) lebt in `Bluetooth.readyScanner()`.
 
 **Build/Install:**
 ```bash
@@ -374,18 +374,24 @@ adb shell am start -n de.schaefer.eosgps/.MainActivity
 
 ```
 android/app/src/main/java/de/schaefer/eosgps/
-├── MainActivity.kt         Screen-Router (Permission/Picker/Main), Onboarding, Device-Picker, Compose UI
-├── GpsTrackingService.kt   FGS nur während GATT-Session (~270 Zeilen, kein Scan, keine Watchdogs)
+├── MainActivity.kt         Screen-Router (~100 Zeilen, Phase 11: aus 770-Zeilen-Monolith extrahiert)
+├── MainScreen.kt           Hauptbildschirm + UI-Helfer (Phase 11)
+├── PermissionFlow.kt       Onboarding-Flow + Permission-Gruppen (Phase 11)
+├── DevicePicker.kt         Kamera-Auswahl-Screen (Phase 11)
+├── GpsTrackingService.kt   FGS nur während GATT-Session (~330 Zeilen), Guard gegen doppelten Stop
 ├── FgScanner.kt            Activity-owned Live-Scanner, 20-min Restart, HW-Filter MAC+CompanyID
-├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff, Shutter-Trigger
+├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff, Shutter-Trigger, State-Timeouts (~580 Zeilen)
 ├── CanonGpsFrame.kt        20-Byte-Binär-Encoder
-├── CanonAd.kt              Scan-Konstanten + powerStateFromByte() (single source of truth)
-├── CanonScanRegistrar.kt   OS-Scan via PendingIntent, HW-Filter inkl. byte5-awake
-├── ScanResultReceiver.kt   Broadcast-Receiver mit Prefs-Hard-Gate
-├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm + Auto-Select
+├── CanonAd.kt              Scan-Konstanten + powerStateFromByte() + scanFilter() (single source of truth)
+├── CanonScanRegistrar.kt   OS-Scan via PendingIntent, nutzt CanonAd.scanFilter(awakeOnly=true)
+├── ScanResultReceiver.kt   Broadcast-Receiver mit Prefs-Hard-Gate + MAC-Verifikation
+├── BootReceiver.kt         BOOT_COMPLETED / MY_PACKAGE_REPLACED → re-arm + Auto-Select, Action-Filter
 ├── Bluetooth.kt            findSelectedDevice + findAllBondedCanon + resolveSelectedDevice + readyScanner
 ├── Prefs.kt                SharedPreferences: trackingEnabled + selectedDeviceMac
 └── TrackingState.kt        StateFlows + `appVisible: Boolean` (Service ↔ UI)
+
+android/app/src/test/java/de/schaefer/eosgps/
+└── CanonGpsFrameTest.kt    11 Unit-Tests (N/S/E/W, LE-Float, NaN-Altitude, Referenzframe)
 ```
 
 **Bewusst nicht implementiert / offene TODOs:**

@@ -24,8 +24,13 @@ fun findSelectedDevice(ctx: Context): BluetoothDevice? {
 fun findAllBondedCanon(ctx: Context): List<BluetoothDevice> {
     if (!hasBluetoothPermissions(ctx)) return emptyList()
     val adapter = bluetoothAdapter(ctx) ?: return emptyList()
+    val selectedMac = Prefs.selectedDeviceMac(ctx)
     return try {
-        adapter.bondedDevices.filter { (it.name ?: "").contains("EOS", true) }
+        adapter.bondedDevices.filter { device ->
+            val name = device.name ?: ""
+            name.contains("EOS", true) || name.contains("Canon", true) ||
+                device.address == selectedMac
+        }
     } catch (_: SecurityException) { emptyList() }
 }
 

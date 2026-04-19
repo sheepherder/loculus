@@ -43,6 +43,11 @@ class ScanResultReceiver : BroadcastReceiver() {
             return
         }
         val first = results.first()
+        val expectedMac = Prefs.selectedDeviceMac(ctx)
+        if (expectedMac != null && first.device?.address != expectedMac) {
+            Log.i(TAG, "scan result MAC ${first.device?.address} ≠ selected $expectedMac — dropping")
+            return
+        }
         Log.i(TAG, "awake ad from ${first.device?.address} rssi=${first.rssi} → waking service")
         GpsTrackingService.start(ctx)
     }

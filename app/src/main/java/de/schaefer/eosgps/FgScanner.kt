@@ -3,7 +3,6 @@ package de.schaefer.eosgps
 import android.annotation.SuppressLint
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -31,7 +30,6 @@ private const val TAG = "FgScanner"
  * pre-emptively stop+start every 20 minutes to avoid drifting into that
  * stale-and-invisible state.
  */
-@SuppressLint("MissingPermission")
 object FgScanner {
 
     private const val RESTART_INTERVAL_MS = 20 * 60_000L
@@ -81,6 +79,7 @@ object FgScanner {
         lastContext = null
     }
 
+    @SuppressLint("MissingPermission")
     private fun startScanInternal(ctx: Context) {
         val s = readyScanner(ctx) ?: run {
             Log.w(TAG, "scanner preflight failed")
@@ -91,10 +90,7 @@ object FgScanner {
             return
         }
         scanner = s
-        val filter = ScanFilter.Builder()
-            .setDeviceAddress(target.address)
-            .setManufacturerData(CanonAd.COMPANY_ID, ByteArray(0), ByteArray(0))
-            .build()
+        val filter = CanonAd.scanFilter(target.address, awakeOnly = false)
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
@@ -110,6 +106,7 @@ object FgScanner {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun stopScanInternal() {
         if (!running) return
         try { scanner?.stopScan(callback) } catch (_: Exception) {}
