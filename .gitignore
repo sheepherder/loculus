@@ -1,3 +1,7 @@
+# AI tooling
+.claude
+.codex
+
 # Android / Gradle
 android/.gradle/
 android/build/
