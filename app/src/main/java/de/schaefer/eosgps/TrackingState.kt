@@ -18,7 +18,7 @@ enum class CameraPowerState { UNSEEN, POWER_ON, AUTO_POWER_OFF, POWER_SW_OFF }
 fun CameraPowerState.label(): String = when (this) {
     CameraPowerState.POWER_ON -> "on"
     CameraPowerState.AUTO_POWER_OFF -> "auto-off"
-    CameraPowerState.POWER_SW_OFF -> "sw-off"
+    CameraPowerState.POWER_SW_OFF -> "off"
     CameraPowerState.UNSEEN -> "unseen"
 }
 

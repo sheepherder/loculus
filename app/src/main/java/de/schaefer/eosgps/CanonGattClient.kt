@@ -112,6 +112,8 @@ class CanonGattClient(
     private val onWriteResult: (status: Int) -> Unit = {},
 ) {
     private var gatt: BluetoothGatt? = null
+    var lastDisconnectStatus: Int = 0
+        private set
     private var statusChar: BluetoothGattCharacteristic? = null
     private var dataChar: BluetoothGattCharacteristic? = null
     private var notifyChar: BluetoothGattCharacteristic? = null
@@ -295,11 +297,12 @@ class CanonGattClient(
 
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-            log("onConnectionStateChange status=$status newState=$newState")
+            log("onConnectionStateChange status=0x${status.toString(16)} newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 state = ConnState.DISCOVERING
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                lastDisconnectStatus = status
                 synchronized(opQueue) { opQueue.clear(); opInFlight = false }
                 g.close()
                 if (gatt === g) gatt = null
