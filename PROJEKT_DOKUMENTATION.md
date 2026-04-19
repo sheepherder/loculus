@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App.
+**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App. Phase 12: GATT-Handshake auf ~550ms optimiert, Sofort-Fix aus Location-Cache.
 
-**Datum:** 2026-04-19 (Phase 11: Code-Review + Refactoring)
+**Datum:** 2026-04-19 (Phase 12: Schnellerer Handshake + Sofort-Fix)
 
 ---
 
@@ -95,18 +95,7 @@ Android-API: `ScanResult.scanRecord.getManufacturerSpecificData(0x01A9)` liefert
 
 Verifiziert via HCI-Snoop der offiziellen Canon Camera Connect App, mehrfach reproduziert auf R6m2:
 
-1. **CCCD-Subscribes** (8 Channels, in dieser Reihenfolge spielt's keine Rolle):
-
-   | UUID | Char | CCCD |
-   |------|------|------|
-   | `00040003` | GPS NOTIFY | `02 00` INDICATE |
-   | `00020002` | HANDOVER DATA | `01 00` NOTIFY |
-   | `00020003` | HANDOVER NOTIFY | `02 00` INDICATE |
-   | `00030001` | Remote STATUS | `01 00` NOTIFY |
-   | `00030002` | Remote EVENTS | `01 00` NOTIFY |
-   | `00030011` | Remote ZOOM | `01 00` NOTIFY |
-   | `00030021` | Remote EXPOSURE | `01 00` NOTIFY |
-   | `00030031` | Remote APERTURE | `01 00` NOTIFY |
+1. **CCCD-Subscribe**: `00040003` GPS NOTIFY mit `02 00` INDICATE.
 
 2. **Write `0x0a` auf `00020002`** (HANDOVER DATA, WRITE_TYPE_DEFAULT). Kamera antwortet mit einer Notification auf derselben Char mit ~20-Byte-Payload (vermutlich Capability-Handshake).
 
@@ -118,7 +107,14 @@ Verifiziert via HCI-Snoop der offiziellen Canon Camera Connect App, mehrfach rep
 
 6. Ab jetzt: **`0x04 + 19 Byte GPS-Fix` auf `00040002`** mit WRITE_TYPE_NO_RESPONSE, Rate Canon-seitig ~15s, wir machen 10s.
 
-**Initial-NOTIFY-Fallback**: Wenn wir bei einer schon warmen Kamera reconnecten (Kamera war in derselben Sitzung bereits ready), schickt sie keine frische `02 00`-Indication weil sich aus ihrer Sicht nichts geändert hat. Wir merken uns deshalb beim ersten Read von `00040003` das Byte 0 — ist es bereits `0x02` und nach dem Pairing-Write kommt keine Indication, nehmen wir das als Ready und gehen in `GPS_SESSION_ACTIVE`.
+**Phase 12 — Entfernte Schritte** (funktioniert ohne, getestet am 19.04.2026):
+
+Die Canon-App subscribed 8 CCCDs und liest initial STATUS + NOTIFY. Wir haben in Phase 12 verifiziert, dass für GPS+Shutter nur die GPS_NOTIFY-Subscription nötig ist. Die entfernten Schritte sind:
+- Initial-Reads von STATUS (`00040001`) und NOTIFY (`00040003`) — Werte waren rein diagnostisch
+- 7 weitere CCCD-Subscriptions: HANDOVER_DATA (`00020002`), HANDOVER_NOTIFY (`00020003`), REMOTE_STATUS/EVENTS/ZOOM/EXPOSURE/APERTURE (`00030001/2/11/21/31`)
+- `initialNotifyByte`-Fallback: sollte bei "bereits ready"-Kameras greifen wenn keine frische Indication kommt, war aber eine Race Condition (die Indication kam ~13ms nach dem Write-Callback, der Fallback feuerte vorher). Der 10s-Timeout (`REQUESTING_GPS`) ist der korrekte Fallback.
+
+**Zeitersparnis:** ~750ms weniger Handshake (Connect→erster Fix: ~550ms statt ~1.5s).
 
 ### GPS-Kommandos auf `00040002`
 
@@ -291,10 +287,12 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 - Power-State aus Advertisement parsen (Byte 5 unter Company-ID `0x01A9`, low-3-bit-Logik): ✅
 - Canon-Kickoff-Sequenz (8 CCCDs + `0x0a`-Handover + Source-Query + `0x01`-Pairing): ✅
 - BT-Icon auf Kamera leuchtet blau (durch Pairing-`01`-Write): ✅
-- Initial-NOTIFY-Fallback für bereits-ready-Kameras: ✅
+- ~~Initial-NOTIFY-Fallback~~ Phase 12: entfernt (Race Condition, 10s-Timeout reicht)
+- Sofort-Fix aus `fused.lastLocation` bei READY_TO_RECEIVE (≤60s Cache): ✅
+- Minimaler Handshake (1 CCCD statt 8, keine Initial-Reads): ✅
 - GPS-Frame-Write (20 Byte binary LE, WRITE_NO_RESPONSE): ✅
 - Graceful Stop mit `{3}` + Disconnect: ✅
-- FusedLocationProvider Auto-Loop (10s-Rate), funktioniert auch bei geschlossener Activity durch FGS-Typ `location|connectedDevice` + `ACCESS_BACKGROUND_LOCATION` Exemption: ✅
+- FusedLocationProvider Auto-Loop (10s-Rate) + Sofort-Fix aus System-Cache, funktioniert auch bei geschlossener Activity durch FGS-Typ `location|connectedDevice` + `ACCESS_BACKGROUND_LOCATION` Exemption: ✅
 - 20-min Scanner-Restart im Vordergrund (gegen Android's stille 30-min-`OPPORTUNISTIC`-Drosselung): ✅
 - UI-seitige Ad-Staleness-Derivation (> 8 s ohne Ad + `connState=IDLE` → `UNSEEN`), kein Watchdog-Timer: ✅
 - OS-Scan-Rearm (`unregister`+`register`) bei FGS-Teardown wenn Activity unsichtbar: ✅
@@ -378,9 +376,9 @@ android/app/src/main/java/de/schaefer/eosgps/
 ├── MainScreen.kt           Hauptbildschirm + UI-Helfer (Phase 11)
 ├── PermissionFlow.kt       Onboarding-Flow + Permission-Gruppen (Phase 11)
 ├── DevicePicker.kt         Kamera-Auswahl-Screen (Phase 11)
-├── GpsTrackingService.kt   FGS nur während GATT-Session (~330 Zeilen), Guard gegen doppelten Stop
+├── GpsTrackingService.kt   FGS nur während GATT-Session, Sofort-Fix aus Location-Cache, Guard gegen doppelten Stop
 ├── FgScanner.kt            Activity-owned Live-Scanner, 20-min Restart, HW-Filter MAC+CompanyID
-├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff, Shutter-Trigger, State-Timeouts (~580 Zeilen)
+├── CanonGattClient.kt      GATT-Op-Queue, Canon-Kickoff (minimal: 1 CCCD), Shutter, State-Timeouts
 ├── CanonGpsFrame.kt        20-Byte-Binär-Encoder
 ├── CanonAd.kt              Scan-Konstanten + powerStateFromByte() + scanFilter() (single source of truth)
 ├── CanonScanRegistrar.kt   OS-Scan via PendingIntent, nutzt CanonAd.scanFilter(awakeOnly=true)
@@ -482,4 +480,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-04-19*
+*Letzte Aktualisierung: 2026-04-19 (Phase 12)*

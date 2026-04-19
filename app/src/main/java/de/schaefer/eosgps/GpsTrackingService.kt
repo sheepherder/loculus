@@ -200,9 +200,11 @@ class GpsTrackingService : Service() {
             },
             onGpsState = {
                 TrackingState.gpsState.value = it
-                if (it == CanonGpsState.READY_TO_RECEIVE &&
-                    TrackingState.sessionStartedAt.value == null) {
-                    TrackingState.sessionStartedAt.value = SystemClock.elapsedRealtime()
+                if (it == CanonGpsState.READY_TO_RECEIVE) {
+                    if (TrackingState.sessionStartedAt.value == null) {
+                        TrackingState.sessionStartedAt.value = SystemClock.elapsedRealtime()
+                    }
+                    sendLastLocationIfFresh()
                 }
                 updateNotification()
             },
@@ -227,6 +229,20 @@ class GpsTrackingService : Service() {
     }
 
     // --- Location ---
+
+    @SuppressLint("MissingPermission")
+    private fun sendLastLocationIfFresh() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED) return
+        fused.lastLocation.addOnSuccessListener { loc ->
+            if (loc == null || TrackingState.fixCount.value > 0) return@addOnSuccessListener
+            val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000
+            if (ageMs <= 60_000) {
+                Log.i(TAG, "immediate fix from cache (age=${ageMs}ms)")
+                onLocation(loc)
+            }
+        }
+    }
 
     @SuppressLint("MissingPermission")
     private fun startLocationUpdates() {

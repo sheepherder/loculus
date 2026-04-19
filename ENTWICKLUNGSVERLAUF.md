@@ -832,4 +832,52 @@ Felder: Alter des Fixes, horizontale Genauigkeit (`loc.accuracy`), Höhe ü. NN 
 
 Das "Letzt."-Label ist `alignTop = true` damit es bei der zweizeiligen Value oben steht statt mittig.
 
-*Letzte Aktualisierung: 2026-04-19*
+## Phase 12 — Schnellerer Handshake + Sofort-Fix (19. April 2026)
+
+### Ausgangsproblem
+
+Beim Session-Cycling (bekannter offener Punkt: ~2s GPS-Session, dann `status=8` Disconnect, 7–11s Pause, Reconnect, Wiederholung) war die Wahrscheinlichkeit hoch, ein Foto ohne GPS zu schießen. In der kurzen 2s-Session musste erst der ~1.5s Handshake durch, dann 5–10s auf den ersten FusedLocationProvider-Callback warten — oft kam der Fix erst nach dem nächsten Disconnect. Durch schnelleren Handshake und Sofort-Fix aus dem Location-Cache sinkt die Wahrscheinlichkeit, dass ein Foto in eine GPS-Lücke fällt.
+
+### Sofort-Fix aus Location-Cache
+
+Neue Methode `sendLastLocationIfFresh()` in `GpsTrackingService`: bei `READY_TO_RECEIVE` wird `fused.lastLocation` abgefragt. Wenn der System-Cache einen Fix hat der ≤60s alt ist, wird er sofort gesendet — noch bevor der erste reguläre Location-Callback kommt. Kein eigenes Caching nötig, der FusedLocationProvider hat einen systemweiten Cache.
+
+### GATT-Handshake-Optimierung
+
+Beim Analysieren des Handshake-Logs fielen drei Zeitfresser auf:
+
+**1. `initialNotifyByte`-Fallback entfernt.** Dieser Fallback las beim Connect den initialen Wert von GPS_NOTIFY (`00040003`), und wenn er `0x02` war (= "ready" aus vorheriger Session gecacht), wurde nach dem letzten Kickoff-Write sofort `READY_TO_RECEIVE` gesetzt — ohne auf die echte Indication zu warten. Problem: die echte Indication kam zuverlässig ~13ms nach dem Write-Callback. Der Fallback feuerte vor der Indication (Race Condition) und verursachte ein doppeltes `READY_TO_RECEIVE`. Die Annahme "Kamera schickt keine frische Indication wenn sie schon ready war" war falsch — sie schickt immer eine. Der 10s-Timeout (`REQUESTING_GPS`) ist der korrekte Fallback für den Fall dass die Indication wirklich ausbleibt.
+
+**2. Initiale Reads entfernt.** STATUS-Read (`00040001`) und NOTIFY-Read (`00040003`) nach Service Discovery kosteten ~120ms. STATUS persistiert über Power-Off und war nie ein zuverlässiges Ready-Signal (dokumentiert seit Phase 5). NOTIFY-Read war nur Input für den entfernten Fallback. Beide Werte wurden nur geloggt, keine Logik hing dran.
+
+**3. 7 von 8 CCCD-Subscriptions entfernt.** Canon's App subscribed 8 Channels (GPS_NOTIFY, HANDOVER_DATA, HANDOVER_NOTIFY, 5× REMOTE_*). Jede Subscription ist ein BLE-Roundtrip (~90ms). Für GPS-Fixes und Shutter-Writes ist nur die GPS_NOTIFY-Subscription nötig — die anderen empfangen eingehende Notifications die wir nicht verarbeiten. Zeitersparnis: ~630ms.
+
+### Ergebnis
+
+| Metrik | Vorher | Nachher |
+|--------|--------|---------|
+| CCCD-Subscriptions | 8 (~720ms) | 1 (~90ms) |
+| Initiale Reads | 2 (~120ms) | 0 |
+| Connect → erster GPS-Fix | ~1.5s + 5–10s Wartezeit | ~550ms + sofort aus Cache |
+| `READY_TO_RECEIVE`-Events pro Connect | 2 (Race) | 1 |
+
+### Entfernte Komponenten (Referenz für Rollback)
+
+Falls sich etwas als problematisch herausstellt:
+
+| Komponente | Was sie tat | UUID / Ort | Warum entfernt |
+|---|---|---|---|
+| `initialNotifyByte` (Feld + Fallback) | Cached initialen NOTIFY-Wert, setzte READY_TO_RECEIVE im Write-Callback wenn Byte=2 | `CanonGattClient.kt` | Race Condition: feuerte vor echter Indication |
+| STATUS-Read | Las `00040001` nach Service Discovery, loggte Byte | `00040001` | Rein diagnostisch, persistiert über Power-Off |
+| NOTIFY-Read | Las `00040003` nach Service Discovery, fütterte `initialNotifyByte` | `00040003` | Input für entfernten Fallback |
+| CCCD HANDOVER_DATA | Subscription für Notifications auf `00020002` | `00020002` NOTIFY `0x0100` | Keine eingehenden Notifications verarbeitet |
+| CCCD HANDOVER_NOTIFY | Subscription für Indications auf `00020003` | `00020003` INDICATE `0x0200` | Keine eingehenden Notifications verarbeitet |
+| CCCD REMOTE_STATUS | Subscription auf `00030001` | `00030001` NOTIFY `0x0100` | Für GPS+Shutter nicht nötig |
+| CCCD REMOTE_EVENTS | Subscription auf `00030002` | `00030002` NOTIFY `0x0100` | Für GPS+Shutter nicht nötig |
+| CCCD REMOTE_ZOOM | Subscription auf `00030011` | `00030011` NOTIFY `0x0100` | Für GPS+Shutter nicht nötig |
+| CCCD REMOTE_EXPOSURE | Subscription auf `00030021` | `00030021` NOTIFY `0x0100` | Für GPS+Shutter nicht nötig |
+| CCCD REMOTE_APERTURE | Subscription auf `00030031` | `00030031` NOTIFY `0x0100` | Für GPS+Shutter nicht nötig |
+
+Ebenfalls entfernte UUID-Konstanten: `GPS_STATUS`, `HANDOVER_NOTIFY`, `REMOTE_STATUS`, `REMOTE_EVENTS`, `REMOTE_ZOOM`, `REMOTE_EXPOSURE`, `REMOTE_APERTURE`. Felder: `statusChar`, `handoverNotifyChar`.
+
+*Letzte Aktualisierung: 2026-04-19 (Phase 12)*
