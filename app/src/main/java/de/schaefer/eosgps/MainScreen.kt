@@ -65,6 +65,9 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
     val sessionStart by TrackingState.sessionStartedAt.collectAsState()
     val lastFixAt by TrackingState.lastFixAt.collectAsState()
     val writeErrors by TrackingState.writeErrors.collectAsState()
+    val accuracy by TrackingState.accuracy.collectAsState()
+    val altitude by TrackingState.altitude.collectAsState()
+    val speed by TrackingState.speed.collectAsState()
 
     var trackingEnabled by remember { mutableStateOf(Prefs.trackingEnabled(ctx)) }
 
@@ -189,12 +192,18 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
             KeyValueRow("Fixes") {
                 MonoText("$fixCount", bold = true)
             }
-            KeyValueRow("Letzt.") {
+            KeyValueRow("Letzt.", alignTop = true) {
                 Column {
                     MonoText(lastFix ?: "—")
                     if (lastFixAt != null) {
+                        val parts = buildList {
+                            add("vor ${formatDuration(nowTick - lastFixAt!!)}")
+                            accuracy?.let { add("±%.0f m".format(it)) }
+                            altitude?.let { add("%.0f m".format(it)) }
+                            speed?.let { add("%.0f km/h".format(it * 3.6f)) }
+                        }
                         Text(
-                            "vor ${formatDuration(nowTick - lastFixAt!!)}",
+                            parts.joinToString(" · "),
                             fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -309,10 +318,10 @@ private fun InfoCard(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun KeyValueRow(label: String, value: @Composable () -> Unit) {
+private fun KeyValueRow(label: String, alignTop: Boolean = false, value: @Composable () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalAlignment = if (alignTop) Alignment.Top else Alignment.CenterVertically,
     ) {
         Text(
             label,
@@ -389,5 +398,12 @@ private fun rssiColor(rssi: Int?): Color = when {
     rssi == null -> Color(0xFF9E9E9E)
     rssi >= -60 -> Color(0xFF4CAF50)
     rssi >= -75 -> Color(0xFFFFB74D)
+    else -> Color(0xFFE57373)
+}
+
+private fun accuracyColor(acc: Float?): Color = when {
+    acc == null -> Color.Unspecified
+    acc <= 5f -> Color(0xFF4CAF50)
+    acc <= 15f -> Color(0xFFFFB74D)
     else -> Color(0xFFE57373)
 }

@@ -244,6 +244,9 @@ class GpsTrackingService : Service() {
             TrackingState.lastFixText.value =
                 "%.6f, %.6f".format(loc.latitude, loc.longitude)
             TrackingState.lastFixAt.value = SystemClock.elapsedRealtime()
+            TrackingState.accuracy.value = if (loc.hasAccuracy()) loc.accuracy else null
+            TrackingState.altitude.value = if (loc.hasAltitude()) loc.altitude else null
+            TrackingState.speed.value = if (loc.hasSpeed()) loc.speed else null
             updateNotification()
         }
     }

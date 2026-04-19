@@ -299,7 +299,7 @@ Kotlin/Compose-App auf Pixel 9a, nutzt die bestehende System-Pairing-Beziehung z
 - UI-seitige Ad-Staleness-Derivation (> 8 s ohne Ad + `connState=IDLE` → `UNSEEN`), kein Watchdog-Timer: ✅
 - OS-Scan-Rearm (`unregister`+`register`) bei FGS-Teardown wenn Activity unsichtbar: ✅
 - Lifecycle-gebundener Compose-Ticker (`repeatOnLifecycle(STARTED)`), kein Dauer-Wake im Hintergrund: ✅
-- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate, Error-Count, Tracking-Switch, Shutter-Button (Kamera-Auslöser-Look, immer sichtbar): ✅
+- Live-UI: Power/Link/GPS-State, RSSI, Session-Uptime, Fix-Count + Rate + Genauigkeit/Höhe/Speed, Error-Count, Tracking-Switch, Shutter-Button (Kamera-Auslöser-Look, immer sichtbar): ✅
 - EXIF in Canon-Fotos identisch zu Canon-App-Output verifiziert: ✅
 
 **Architekturübersicht:**

@@ -819,4 +819,17 @@ Visibility: `private` → `internal` für cross-file Composables/Funktionen.
 
 Codebasis ist jetzt sauber strukturiert (15 Dateien statt monolithischer MainActivity), GATT-State-Machine ist robust gegen Hänger und Doppel-Teardowns, Security-Basics sind abgedeckt, und der GPS-Frame-Encoder hat eine verifizierte Testsuite. Alle 22 Review-Findings sind bearbeitet (19 gefixt, 3 bewusst nicht gefixt mit Begründung).
 
+### GPS-Fix-Details in der UI
+
+GPS-Sitzung-Card zeigt jetzt unter den Koordinaten eine kompakte Subzeile mit Fix-Metadaten aus dem `FusedLocationProvider`:
+
+```
+Letzt.    49,789685, 9,942761
+          vor 0:05 · ±12 m · 245 m · 3 km/h
+```
+
+Felder: Alter des Fixes, horizontale Genauigkeit (`loc.accuracy`), Höhe ü. NN (`loc.altitude`), Geschwindigkeit (`loc.speed` → km/h). Satellitenzahl wurde evaluiert aber verworfen — `FusedLocationProvider` liefert sie nicht zuverlässig (`extras.getInt("satellites")` ist fast immer 0 oder absent).
+
+Das "Letzt."-Label ist `alignTop = true` damit es bei der zweizeiligen Value oben steht statt mittig.
+
 *Letzte Aktualisierung: 2026-04-19*

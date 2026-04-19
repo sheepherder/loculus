@@ -51,6 +51,9 @@ object TrackingState {
     val sessionStartedAt = MutableStateFlow<Long?>(null)
     val lastFixAt = MutableStateFlow<Long?>(null)  // elapsedRealtime() of last successful write
     val writeErrors = MutableStateFlow(0)
+    val accuracy = MutableStateFlow<Float?>(null)
+    val altitude = MutableStateFlow<Double?>(null)
+    val speed = MutableStateFlow<Float?>(null)
 
     fun resetSession() {
         fixCount.value = 0
@@ -59,5 +62,8 @@ object TrackingState {
         lastFixAt.value = null
         rssi.value = null
         writeErrors.value = 0
+        accuracy.value = null
+        altitude.value = null
+        speed.value = null
     }
 }
