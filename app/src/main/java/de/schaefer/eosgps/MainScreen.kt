@@ -35,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -188,34 +189,39 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
 
         Spacer(Modifier.height(8.dp))
 
-        InfoCard("GPS-Sitzung") {
-            KeyValueRow("Fixes") {
-                MonoText("$fixCount", bold = true)
-            }
-            KeyValueRow("Letzt.", alignTop = true) {
-                Column {
-                    MonoText(lastFix ?: "—")
-                    if (lastFixAt != null) {
-                        val parts = buildList {
-                            add("vor ${formatDuration(nowTick - lastFixAt!!)}")
-                            accuracy?.let { add("±%.0f m".format(it)) }
-                            altitude?.let { add("%.0f m".format(it)) }
-                            speed?.let { add("%.0f km/h".format(it * 3.6f)) }
-                        }
+        val gpsActive = gpsState == CanonGpsState.READY_TO_RECEIVE
+        InfoCard(if (gpsActive) "GPS-Sitzung · aktiv" else "GPS-Sitzung · inaktiv") {
+            val contentAlpha = if (gpsActive) 1f else 0.38f
+            Column(modifier = Modifier.graphicsLayer { alpha = contentAlpha }) {
+                KeyValueRow("Fixes") {
+                    MonoText("$fixCount", bold = true)
+                }
+                KeyValueRow("Letzter", alignTop = true) {
+                    Column {
+                        MonoText(lastFix ?: "—")
+                        val subLine = if (lastFixAt != null) {
+                            val parts = buildList {
+                                if (gpsActive) add("vor ${formatDuration(nowTick - lastFixAt!!)}")
+                                accuracy?.let { add("±%.0f m".format(it)) }
+                                altitude?.let { add("%.0f m".format(it)) }
+                                speed?.let { add("%.0f km/h".format(it * 3.6f)) }
+                            }
+                            parts.joinToString(" · ")
+                        } else "—"
                         Text(
-                            parts.joinToString(" · "),
+                            subLine,
                             fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
                 }
-            }
-            KeyValueRow("Rate") {
-                MonoText(rateText(fixCount, sessionStart, nowTick))
-            }
-            if (writeErrors > 0) {
-                KeyValueRow("Fehler") {
-                    MonoText("$writeErrors", color = Color(0xFFE57373))
+                KeyValueRow("Rate") {
+                    MonoText(rateText(fixCount, sessionStart, nowTick))
+                }
+                if (writeErrors > 0) {
+                    KeyValueRow("Fehler") {
+                        MonoText("$writeErrors", color = Color(0xFFE57373))
+                    }
                 }
             }
         }
