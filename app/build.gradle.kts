@@ -5,6 +5,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val appVersion = "0.1.0"
+
+base {
+    archivesName = "loculus-$appVersion"
+}
+
 android {
     namespace = "de.schaefer.eosgps"
     compileSdk = 36
@@ -14,7 +20,7 @@ android {
         minSdk = 33
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1"
+        versionName = appVersion
     }
 
     buildFeatures {
@@ -32,6 +38,7 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
+
 }
 
 kotlin {
