@@ -155,9 +155,7 @@ class GpsTrackingService : Service() {
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
         activeService = null
-        gatt?.stopAndDisconnect()
-        // Null before async disconnect returns — prevents the IDLE callback
-        // from re-entering stopTracking() via onGattDisconnected().
+        gatt?.sendStopAndClose()
         gatt = null
         bondedDevice = null
         TrackingState.connState.value = ConnState.IDLE
@@ -170,9 +168,11 @@ class GpsTrackingService : Service() {
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
         if (activeService === this) activeService = null
-        gatt?.stopAndDisconnect()
+        gatt?.sendStopAndClose()
         gatt = null
         TrackingState.serviceRunning.value = false
+        TrackingState.connState.value = ConnState.IDLE
+        TrackingState.gpsState.value = CanonGpsState.UNKNOWN
 
         // Rearm (unregister+register) rather than trusting the OS scan
         // engine's edge state: after a long GATT session it may still see

@@ -67,7 +67,6 @@ enum class ConnState {
     SUBSCRIBING,
     REQUESTING_GPS,     // Canon kickoff sent, waiting for [2,…] ready indication
     GPS_SESSION_ACTIVE, // camera is ready to receive GPS frames
-    STOPPING,
     DISCONNECTING,
 }
 
@@ -108,6 +107,7 @@ class CanonGattClient(
 
     private val opQueue = ArrayDeque<GattOp>()
     @Volatile private var opInFlight = false
+    @Volatile private var disposed = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val stateTimeout = Runnable {
@@ -120,10 +120,6 @@ class CanonGattClient(
                 Log.w(TAG, "REQUESTING_GPS timeout (10s) — disconnecting")
                 doDisconnect()
             }
-            ConnState.STOPPING -> {
-                Log.w(TAG, "STOPPING timeout (5s) — forcing disconnect")
-                doDisconnect()
-            }
             else -> {}
         }
     }
@@ -132,14 +128,14 @@ class CanonGattClient(
         private set(value) {
             field = value
             Log.i(TAG, "state -> $value")
-            onStateChange(value)
+            if (!disposed) onStateChange(value)
         }
 
     @Volatile var gpsState: CanonGpsState = CanonGpsState.UNKNOWN
         private set(value) {
             field = value
             Log.i(TAG, "gpsState -> $value")
-            onGpsState(value)
+            if (!disposed) onGpsState(value)
         }
 
     // --- Public API ---
@@ -197,24 +193,22 @@ class CanonGattClient(
     }
 
     /**
-     * Graceful teardown. Always send 0x03 (stop GPS) when the camera is in a
-     * ready-to-receive state — otherwise the camera is left expecting more
-     * fixes and can end up in a bad state on the next reconnect, leading to a
-     * firmware hang ("Busy" lock requiring battery pull).
+     * Send 0x03 fire-and-forget, then disconnect and silence all further
+     * callbacks so no delayed work can outlive the owning service and
+     * overwrite [TrackingState].
      */
-    fun stopAndDisconnect() {
-        val g = gatt
-        if (g == null) { state = ConnState.IDLE; return }
+    fun sendStopAndClose() {
+        disposed = true
+        handler.removeCallbacks(stateTimeout)
+        val g = gatt ?: return
         val ch = dataChar
         if (ch != null && gpsState == CanonGpsState.READY_TO_RECEIVE) {
-            state = ConnState.STOPPING
-            enqueue(GattOp.Write(ch, byteArrayOf(0x03), "stop GPS",
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT))
-            handler.removeCallbacks(stateTimeout)
-            handler.postDelayed(stateTimeout, 5_000L)
-        } else {
-            doDisconnect()
+            writeChar(g, ch, byteArrayOf(0x03), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
         }
+        clearQueue()
+        gatt = null
+        g.disconnect()
+        g.close()
     }
 
     private fun doDisconnect() {
@@ -255,10 +249,6 @@ class CanonGattClient(
             if (!ok) {
                 Log.i(TAG,"op dispatch returned false, advancing")
                 opInFlight = false
-                if (state == ConnState.STOPPING && opQueue.isEmpty()) {
-                    doDisconnect()
-                    return
-                }
                 pump()
             }
         }
@@ -282,6 +272,7 @@ class CanonGattClient(
     private val callback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             Log.i(TAG,"onConnectionStateChange status=0x${status.toString(16)} newState=$newState")
+            if (disposed) return
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     Log.i(TAG,"connect failed status=0x${status.toString(16)}, closing")
@@ -402,11 +393,6 @@ class CanonGattClient(
             Log.i(TAG,"onCharacteristicWrite ${shortUuid(ch.uuid)} status=$status")
             onWriteResult(status)
             opCompleted()
-            if (state == ConnState.STOPPING) {
-                synchronized(opQueue) {
-                    if (opQueue.isEmpty() && !opInFlight) doDisconnect()
-                }
-            }
         }
 
         override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, status: Int) {
