@@ -30,7 +30,7 @@ import com.google.android.gms.location.Priority
 private const val TAG = "GpsService"
 private const val CHANNEL_ID = "eos-gps-tracking"
 private const val NOTIF_ID = 42
-private const val RSSI_POLL_INTERVAL_MS = 5_000L
+private const val RSSI_POLL_INTERVAL_MS = 500L
 
 /**
  * Foreground service owning the GATT session to the Canon camera. Lifetime
