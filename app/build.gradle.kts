@@ -32,8 +32,18 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file(System.getProperty("user.home") + "/.android/release.keystore")
+            storePassword = findProperty("RELEASE_STORE_PASSWORD") as String
+            keyAlias = "apps"
+            keyPassword = findProperty("RELEASE_KEY_PASSWORD") as String
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }

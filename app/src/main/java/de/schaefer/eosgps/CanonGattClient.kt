@@ -15,6 +15,7 @@ import java.util.ArrayDeque
 import java.util.UUID
 
 private const val TAG = "CanonGatt"
+private const val STOP_WRITE_DRAIN_MS = 200L
 
 object CanonUuids {
     // GPS service (0x00040000). All GPS-related reads, writes and indications.
@@ -204,7 +205,13 @@ class CanonGattClient(
         val ch = dataChar
         if (ch != null && gpsState == CanonGpsState.READY_TO_RECEIVE) {
             writeChar(g, ch, byteArrayOf(0x03), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+            handler.postDelayed({ closeGatt(g) }, STOP_WRITE_DRAIN_MS)
+        } else {
+            closeGatt(g)
         }
+    }
+
+    private fun closeGatt(g: BluetoothGatt) {
         clearQueue()
         gatt = null
         g.disconnect()

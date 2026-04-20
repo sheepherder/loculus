@@ -53,8 +53,6 @@ class GpsTrackingService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var notifMgr: NotificationManager
     private lateinit var tapIntent: PendingIntent
-    private lateinit var stopPendingIntent: PendingIntent
-
     private val rssiPollRunnable = object : Runnable {
         override fun run() {
             gatt?.readRssi()
@@ -71,11 +69,6 @@ class GpsTrackingService : Service() {
         tapIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        stopPendingIntent = PendingIntent.getService(
-            this, 1,
-            Intent(this, GpsTrackingService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         createNotificationChannel()
@@ -301,7 +294,6 @@ class GpsTrackingService : Service() {
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)
             .setContentIntent(tapIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .build()
 
     private fun updateNotification() {
