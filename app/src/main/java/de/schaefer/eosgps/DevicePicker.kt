@@ -67,7 +67,7 @@ internal fun DevicePicker(onDeviceSelected: () -> Unit, onBack: (() -> Unit)? = 
             .verticalScroll(rememberScrollState()),
     ) {
         Text(
-            "EOS GPS",
+            APP_NAME,
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.SemiBold,
         )

@@ -122,7 +122,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
         modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 10.dp)
             .verticalScroll(rememberScrollState()),
     ) {
-        Text("EOS GPS", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+        Text(APP_NAME, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
         Text(
             selectedDevice?.name ?: "—",
             fontFamily = FontFamily.Monospace, fontSize = 11.sp,

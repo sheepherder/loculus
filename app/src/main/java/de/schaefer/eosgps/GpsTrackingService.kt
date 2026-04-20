@@ -32,6 +32,10 @@ private const val CHANNEL_ID = "eos-gps-tracking"
 private const val NOTIF_ID = 42
 private const val RSSI_POLL_INTERVAL_MS = 500L
 
+internal const val GPS_INTERVAL_MS = 10_000L
+internal const val GPS_FASTEST_INTERVAL_MS = 5_000L
+internal const val INITIAL_FIX_MAX_AGE_MS = 60_000L
+
 /**
  * Foreground service owning the GATT session to the Canon camera. Lifetime
  * is scoped exactly to that session: start → connect → stream GPS fixes →
@@ -230,7 +234,7 @@ class GpsTrackingService : Service() {
         fused.lastLocation.addOnSuccessListener { loc ->
             if (loc == null || TrackingState.fixCount.value > 0) return@addOnSuccessListener
             val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000
-            if (ageMs <= 60_000) {
+            if (ageMs <= INITIAL_FIX_MAX_AGE_MS) {
                 Log.i(TAG, "immediate fix from cache (age=${ageMs}ms)")
                 onLocation(loc)
             }
@@ -247,8 +251,8 @@ class GpsTrackingService : Service() {
         // Primary interval 10 s matcht Canon-Camera-Connect (`i4.n.java:552`).
         // Fastest 5 s lässt Android uns Updates früher zustellen wenn eine
         // andere App parallel GPS anfordert.
-        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10_000L)
-            .setMinUpdateIntervalMillis(5000L)
+        val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, GPS_INTERVAL_MS)
+            .setMinUpdateIntervalMillis(GPS_FASTEST_INTERVAL_MS)
             .build()
         fused.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
     }
@@ -289,7 +293,7 @@ class GpsTrackingService : Service() {
 
     private fun buildNotification(text: String): Notification =
         NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("EOS GPS")
+            .setContentTitle(APP_NAME)
             .setContentText(text)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setOngoing(true)

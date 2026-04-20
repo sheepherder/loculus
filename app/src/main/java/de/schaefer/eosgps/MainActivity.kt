@@ -23,7 +23,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
-private enum class Screen { PERMISSION, DEVICE_PICKER, MAIN }
+private enum class Screen { WELCOME, PERMISSION, DEVICE_PICKER, MAIN }
 
 class MainActivity : ComponentActivity() {
 
@@ -57,7 +57,8 @@ class MainActivity : ComponentActivity() {
 // Screen router
 // ---------------------------------------------------------------------------
 
-private fun currentScreen(ctx: Context): Screen = when {
+private fun currentScreen(ctx: Context, welcomeDismissed: Boolean = true): Screen = when {
+    !hasAllPerms(ctx) && !welcomeDismissed -> Screen.WELCOME
     !hasAllPerms(ctx) -> Screen.PERMISSION
     findSelectedDevice(ctx) == null -> Screen.DEVICE_PICKER
     else -> Screen.MAIN
@@ -66,9 +67,10 @@ private fun currentScreen(ctx: Context): Screen = when {
 @Composable
 fun AppScreen() {
     val ctx = LocalContext.current
+    var welcomeDismissed by remember { mutableStateOf(hasAllPerms(ctx)) }
     var screen by remember {
         resolveSelectedDevice(ctx)
-        mutableStateOf(currentScreen(ctx))
+        mutableStateOf(currentScreen(ctx, welcomeDismissed))
     }
 
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -76,7 +78,7 @@ fun AppScreen() {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 resolveSelectedDevice(ctx)
-                screen = currentScreen(ctx)
+                screen = currentScreen(ctx, welcomeDismissed)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -84,12 +86,16 @@ fun AppScreen() {
     }
 
     when (screen) {
+        Screen.WELCOME -> WelcomeScreen(onContinue = {
+            welcomeDismissed = true
+            screen = Screen.PERMISSION
+        })
         Screen.PERMISSION -> PermissionFlow(onDone = {
             resolveSelectedDevice(ctx)
-            screen = currentScreen(ctx)
+            screen = currentScreen(ctx, welcomeDismissed)
         })
         Screen.DEVICE_PICKER -> DevicePicker(
-            onDeviceSelected = { screen = currentScreen(ctx) },
+            onDeviceSelected = { screen = currentScreen(ctx, welcomeDismissed) },
             onBack = if (Prefs.selectedDeviceMac(ctx) != null) {{
                 FgScanner.start(ctx)
                 screen = Screen.MAIN

@@ -37,6 +37,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
+import androidx.core.content.PackageManagerCompat
+import androidx.core.content.UnusedAppRestrictionsConstants
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -46,7 +49,8 @@ internal data class PermGroup(
     val description: String,
     val permissions: List<String>?,
     val isGranted: (Context) -> Boolean,
-    val isBatteryOpt: Boolean = false,
+    val customAction: ((Context) -> Unit)? = null,
+    val buttonLabel: String = "Erlauben",
 )
 
 internal fun permGroups(): List<PermGroup> = buildList {
@@ -70,7 +74,7 @@ internal fun permGroups(): List<PermGroup> = buildList {
     ))
     add(PermGroup(
         title = "Benachrichtigungen",
-        description = "Während GPS an die Kamera gestreamt wird, zeigt die App eine Benachrichtigung. So weißt du immer, wenn die Verbindung aktiv ist.",
+        description = "Android verlangt für aktive Hintergrunddienste eine sichtbare Benachrichtigung. Sie ist auf minimal störend geschaltet — kein Ton, keine Vibration — und verschwindet automatisch, wenn die Verbindung zur Kamera endet.",
         permissions = listOf(Manifest.permission.POST_NOTIFICATIONS),
         isGranted = { ContextCompat.checkSelfPermission(it, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED },
     ))
@@ -79,7 +83,16 @@ internal fun permGroups(): List<PermGroup> = buildList {
         description = "Ohne diese Ausnahme kann Android die App im Hintergrund drosseln und die Bluetooth-Verbindung unterbrechen.",
         permissions = null,
         isGranted = { isBatteryOptIgnored(it) },
-        isBatteryOpt = true,
+        customAction = { requestBatteryOptExemption(it) },
+        buttonLabel = "Einstellung öffnen",
+    ))
+    add(PermGroup(
+        title = "App bei Nichtnutzung pausieren",
+        description = "Diese App wird selten aktiv geöffnet — sie arbeitet ja im Hintergrund. Android kann unbenutzte Apps pausieren und ihre Berechtigungen entziehen. Damit das nicht passiert, muss diese Einstellung deaktiviert werden.",
+        permissions = null,
+        isGranted = { !hasUnusedAppRestrictions(it) },
+        customAction = { openUnusedAppRestrictionsSettings(it) },
+        buttonLabel = "Einstellung öffnen",
     ))
 }
 
@@ -123,7 +136,7 @@ internal fun PermissionFlow(onDone: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            "EOS GPS",
+            APP_NAME,
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.SemiBold,
         )
@@ -143,8 +156,8 @@ internal fun PermissionFlow(onDone: () -> Unit) {
         Spacer(Modifier.height(32.dp))
         Button(
             onClick = {
-                if (group.isBatteryOpt) {
-                    requestBatteryOptExemption(ctx)
+                if (group.customAction != null) {
+                    group.customAction.invoke(ctx)
                 } else {
                     val perms = group.permissions ?: return@Button
                     if (perms.size == 1) {
@@ -156,10 +169,10 @@ internal fun PermissionFlow(onDone: () -> Unit) {
             },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(if (group.isBatteryOpt) "Einstellung öffnen" else "Erlauben")
+            Text(group.buttonLabel)
         }
 
-        if (!group.isBatteryOpt && group.permissions != null) {
+        if (group.customAction == null && group.permissions != null) {
             val anyDenied = group.permissions.any {
                 ContextCompat.checkSelfPermission(ctx, it) != PackageManager.PERMISSION_GRANTED
             }
@@ -194,6 +207,24 @@ private fun isBatteryOptIgnored(ctx: Context): Boolean {
 private fun requestBatteryOptExemption(ctx: Context) {
     val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
         .setData(Uri.fromParts("package", ctx.packageName, null))
+        .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    ctx.startActivity(intent)
+}
+
+private fun hasUnusedAppRestrictions(ctx: Context): Boolean {
+    return try {
+        val future = PackageManagerCompat.getUnusedAppRestrictionsStatus(ctx)
+        val status = future.get()
+        status == UnusedAppRestrictionsConstants.API_30_BACKPORT
+                || status == UnusedAppRestrictionsConstants.API_30
+                || status == UnusedAppRestrictionsConstants.API_31
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private fun openUnusedAppRestrictionsSettings(ctx: Context) {
+    val intent = IntentCompat.createManageUnusedAppRestrictionsIntent(ctx, ctx.packageName)
         .setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     ctx.startActivity(intent)
 }

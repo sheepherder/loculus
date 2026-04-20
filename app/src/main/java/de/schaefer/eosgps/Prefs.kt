@@ -13,6 +13,8 @@ import android.content.SharedPreferences
  * the old value into the new key and drop the old one so existing installs
  * don't silently lose their opt-in.
  */
+internal const val APP_NAME = "Loculus"
+
 object Prefs {
     private const val NAME = "eos_gps_prefs"
     private const val KEY_TRACKING = "tracking_enabled"
