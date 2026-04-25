@@ -73,15 +73,16 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
     var trackingEnabled by remember { mutableStateOf(Prefs.trackingEnabled(ctx)) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
+    fun onResume() {
+        CanonScanRegistrar.unregister(ctx)
+        FgScanner.start(ctx)
+        trackingEnabled = Prefs.trackingEnabled(ctx)
+        selectedDevice = findSelectedDevice(ctx)
+    }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> {
-                    CanonScanRegistrar.unregister(ctx)
-                    FgScanner.start(ctx)
-                    trackingEnabled = Prefs.trackingEnabled(ctx)
-                    selectedDevice = findSelectedDevice(ctx)
-                }
+                Lifecycle.Event.ON_RESUME -> onResume()
                 Lifecycle.Event.ON_PAUSE -> {
                     FgScanner.stop()
                     if (Prefs.trackingEnabled(ctx) && !TrackingState.serviceRunning.value) {
@@ -93,10 +94,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
-            CanonScanRegistrar.unregister(ctx)
-            FgScanner.start(ctx)
-            trackingEnabled = Prefs.trackingEnabled(ctx)
-            selectedDevice = findSelectedDevice(ctx)
+            onResume()
         }
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
@@ -228,7 +226,6 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
 
         Spacer(Modifier.height(8.dp))
 
-        val shutterReady = gpsState == CanonGpsState.READY_TO_RECEIVE
         ElevatedCard(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -247,10 +244,10 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
                         .size(64.dp)
                         .clip(CircleShape)
                         .background(
-                            if (shutterReady) Color.White
+                            if (gpsActive) Color.White
                             else Color(0xFF444444)
                         )
-                        .clickable(enabled = shutterReady) {
+                        .clickable(enabled = gpsActive) {
                             GpsTrackingService.triggerShutter(ctx)
                         }
                         .padding(4.dp),
@@ -261,7 +258,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
                             .size(52.dp)
                             .clip(CircleShape)
                             .background(
-                                if (shutterReady) Color(0xFFE0E0E0)
+                                if (gpsActive) Color(0xFFE0E0E0)
                                 else Color(0xFF333333)
                             ),
                     )
@@ -324,7 +321,7 @@ private fun InfoCard(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun KeyValueRow(label: String, alignTop: Boolean = false, value: @Composable () -> Unit) {
+private fun KeyValueRow(label: String, alignTop: Boolean = false, content: @Composable () -> Unit) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
         verticalAlignment = if (alignTop) Alignment.Top else Alignment.CenterVertically,
@@ -335,7 +332,7 @@ private fun KeyValueRow(label: String, alignTop: Boolean = false, value: @Compos
             fontFamily = FontFamily.Monospace, fontSize = 11.sp,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        Row(verticalAlignment = Alignment.CenterVertically) { value() }
+        Row(verticalAlignment = Alignment.CenterVertically) { content() }
     }
 }
 

@@ -86,8 +86,6 @@ object CanonScanRegistrar {
 
     private fun buildPendingIntent(ctx: Context): PendingIntent {
         val intent = Intent(ctx, ScanResultReceiver::class.java)
-        // FLAG_MUTABLE required on API 31+ because the BT stack fills the
-        // intent extras with the ScanResult before delivery.
         return PendingIntent.getBroadcast(
             ctx,
             PI_REQUEST_CODE,

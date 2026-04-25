@@ -2,6 +2,7 @@ package de.schaefer.eosgps
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 
 /**
  * SharedPreferences wrapper. One flag: `trackingEnabled` — passive behavior
@@ -28,20 +29,20 @@ object Prefs {
         val p = prefs(ctx)
         if (!p.contains(KEY_TRACKING) && p.contains(LEGACY_KEY_AUTO_START)) {
             val legacy = p.getBoolean(LEGACY_KEY_AUTO_START, false)
-            p.edit().putBoolean(KEY_TRACKING, legacy).remove(LEGACY_KEY_AUTO_START).apply()
+            p.edit { putBoolean(KEY_TRACKING, legacy); remove(LEGACY_KEY_AUTO_START) }
             return legacy
         }
         return p.getBoolean(KEY_TRACKING, true)
     }
 
     fun setTrackingEnabled(ctx: Context, value: Boolean) {
-        prefs(ctx).edit().putBoolean(KEY_TRACKING, value).apply()
+        prefs(ctx).edit { putBoolean(KEY_TRACKING, value) }
     }
 
     fun selectedDeviceMac(ctx: Context): String? =
         prefs(ctx).getString(KEY_DEVICE_MAC, null)
 
     fun setSelectedDeviceMac(ctx: Context, mac: String?) {
-        prefs(ctx).edit().putString(KEY_DEVICE_MAC, mac).apply()
+        prefs(ctx).edit { putString(KEY_DEVICE_MAC, mac) }
     }
 }

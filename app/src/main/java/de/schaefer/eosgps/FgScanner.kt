@@ -1,6 +1,7 @@
 package de.schaefer.eosgps
 
 import android.annotation.SuppressLint
+import android.app.Application
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
@@ -60,11 +61,11 @@ object FgScanner {
         }
     }
 
-    private var lastContext: Context? = null
+    private var lastContext: Application? = null
 
     fun start(ctx: Context) {
         if (running) return
-        lastContext = ctx.applicationContext
+        lastContext = ctx.applicationContext as Application
         // Defensive: an earlier failed-then-restarted cycle could have left a
         // pending restart scheduled. Cancel before re-scheduling so we never
         // end up with two parallel 20-min loops.
@@ -80,7 +81,7 @@ object FgScanner {
     }
 
     @SuppressLint("MissingPermission")
-    private fun startScanInternal(ctx: Context) {
+    internal fun startScanInternal(ctx: Context) {
         val s = readyScanner(ctx) ?: run {
             Log.w(TAG, "scanner preflight failed")
             return
@@ -107,13 +108,13 @@ object FgScanner {
     }
 
     @SuppressLint("MissingPermission")
-    private fun stopScanInternal() {
+    internal fun stopScanInternal() {
         if (!running) return
         try { scanner?.stopScan(callback) } catch (_: Exception) {}
         running = false
     }
 
-    private fun handle(result: ScanResult) {
+    internal fun handle(result: ScanResult) {
         val mfg = result.scanRecord?.getManufacturerSpecificData(CanonAd.COMPANY_ID) ?: return
         if (mfg.size <= CanonAd.POWER_BYTE_INDEX) return
         val now = SystemClock.elapsedRealtime()

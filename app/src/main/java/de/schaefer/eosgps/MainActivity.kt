@@ -57,11 +57,14 @@ class MainActivity : ComponentActivity() {
 // Screen router
 // ---------------------------------------------------------------------------
 
-private fun currentScreen(ctx: Context, welcomeDismissed: Boolean = true): Screen = when {
-    !hasAllPerms(ctx) && !welcomeDismissed -> Screen.WELCOME
-    !hasAllPerms(ctx) -> Screen.PERMISSION
-    findSelectedDevice(ctx) == null -> Screen.DEVICE_PICKER
-    else -> Screen.MAIN
+private fun currentScreen(ctx: Context, welcomeDismissed: Boolean = true): Screen {
+    val permsOk = hasAllPerms(ctx)
+    return when {
+        !permsOk && !welcomeDismissed -> Screen.WELCOME
+        !permsOk -> Screen.PERMISSION
+        findSelectedDevice(ctx) == null -> Screen.DEVICE_PICKER
+        else -> Screen.MAIN
+    }
 }
 
 @Composable

@@ -7,6 +7,7 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
@@ -71,7 +72,7 @@ enum class ConnState {
     DISCONNECTING,
 }
 
-private sealed class GattOp {
+internal sealed class GattOp {
     data class Write(
         val ch: BluetoothGattCharacteristic,
         val data: ByteArray,
@@ -126,14 +127,14 @@ class CanonGattClient(
     }
 
     @Volatile var state: ConnState = ConnState.IDLE
-        private set(value) {
+        internal set(value) {
             field = value
             Log.i(TAG, "state -> $value")
             if (!disposed) onStateChange(value)
         }
 
     @Volatile var gpsState: CanonGpsState = CanonGpsState.UNKNOWN
-        private set(value) {
+        internal set(value) {
             field = value
             Log.i(TAG, "gpsState -> $value")
             if (!disposed) onGpsState(value)
@@ -145,7 +146,11 @@ class CanonGattClient(
         if (state != ConnState.IDLE) { Log.i(TAG,"connect ignored, state=$state"); return }
         Log.i(TAG,"connect ${device.address}")
         state = ConnState.CONNECTING
-        val g = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        @Suppress("DEPRECATION") // replacement BluetoothGattConnectionSettings is hidden on API 36
+        val g = device.connectGatt(
+            context, false, callback,
+            BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M, handler,
+        )
         if (g == null) {
             Log.w(TAG, "connectGatt returned null")
             state = ConnState.IDLE
@@ -218,7 +223,7 @@ class CanonGattClient(
         g.close()
     }
 
-    private fun doDisconnect() {
+    internal fun doDisconnect() {
         val g = gatt ?: run { state = ConnState.IDLE; return }
         state = ConnState.DISCONNECTING
         g.disconnect()
@@ -226,7 +231,7 @@ class CanonGattClient(
 
     // --- Op queue ---
 
-    private fun enqueue(op: GattOp) {
+    internal fun enqueue(op: GattOp) {
         synchronized(opQueue) {
             opQueue.add(op)
             if (!opInFlight) pump()
@@ -261,18 +266,18 @@ class CanonGattClient(
         }
     }
 
-    private fun clearQueue() = synchronized(opQueue) { opQueue.clear(); opInFlight = false }
+    internal fun clearQueue() = synchronized(opQueue) { opQueue.clear(); opInFlight = false }
 
-    private fun opCompleted() {
+    internal fun opCompleted() {
         synchronized(opQueue) { opInFlight = false }
         pump()
     }
 
     private fun writeChar(g: BluetoothGatt, ch: BluetoothGattCharacteristic, data: ByteArray, writeType: Int): Boolean =
-        g.writeCharacteristic(ch, data, writeType) == BluetoothGatt.GATT_SUCCESS
+        g.writeCharacteristic(ch, data, writeType) == BluetoothStatusCodes.SUCCESS
 
     private fun writeDesc(g: BluetoothGatt, desc: BluetoothGattDescriptor, data: ByteArray): Boolean =
-        g.writeDescriptor(desc, data) == BluetoothGatt.GATT_SUCCESS
+        g.writeDescriptor(desc, data) == BluetoothStatusCodes.SUCCESS
 
     // --- GATT callback ---
 
@@ -440,12 +445,12 @@ class CanonGattClient(
         }
     }
 
-    private fun gpsSourceName(src: Int) = when (src) {
+    internal fun gpsSourceName(src: Int) = when (src) {
         0 -> "DISABLE"; 1 -> "GPS_RECEIVER"; 2 -> "BUILTIN_GPS"
         3 -> "BUILTIN_OFF"; 4 -> "SMARTPHONE"; else -> "?"
     }
 
-    private fun shortUuid(uuid: UUID): String = uuid.toString().substring(4, 8)
+    internal fun shortUuid(uuid: UUID): String = uuid.toString().substring(4, 8)
 }
 
-private fun ByteArray.toHexCompact(): String = joinToString("") { "%02x".format(it) }
+internal fun ByteArray.toHexCompact(): String = joinToString("") { "%02x".format(it) }

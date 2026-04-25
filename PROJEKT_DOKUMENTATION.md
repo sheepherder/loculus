@@ -4,9 +4,9 @@
 
 **Ziel:** Eine Lösung entwickeln, die automatisch GPS-Koordinaten an die Canon EOS R6 Mark II sendet, sobald die Kamera eingeschaltet und per Bluetooth erreichbar ist - ohne manuelles Starten der Canon Camera Connect App.
 
-**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App. Phase 12: GATT-Handshake auf ~550ms optimiert, Sofort-Fix aus Location-Cache.
+**Status:** Android-App produktiv. Ein-Schalter-Architektur (`trackingEnabled`, Default: an) mit Onboarding-Flow (sequenzielle Permission-Screens + Kamera-Auswahl). Scanner-Ownership strikt getrennt — Activity-owned Live-Scanner im Vordergrund, OS-offloaded PendingIntent-Scan im Hintergrund, Foreground Service existiert nur während der GATT-Session. Kamera wird aus persistierter MAC-Auswahl geladen (Auto-Select bei genau einer gebondeten EOS-Kamera, Picker bei mehreren). GPS-Übertragung zur Canon EOS R6 Mark II vollständig validiert, EXIF-Output identisch zur Canon-App. Phase 12: GATT-Handshake auf ~550ms optimiert, Sofort-Fix aus Location-Cache. Phase 13: Build-Modernisierung (Version Catalog, SDK 37, minSdk 34, Java 21, striktere Compiler/Lint-Config, R8 Log-Stripping).
 
-**Datum:** 2026-04-19 (Phase 12: Schnellerer Handshake + Sofort-Fix)
+**Datum:** 2026-04-25 (Phase 13: Modernisierung & Strictness)
 
 ---
 
@@ -361,12 +361,12 @@ OS-Scan-Stage wird nur auf echte Wake-Events aufgeweckt; der PendingIntent-Broad
 
 **Build/Install:**
 ```bash
-cd android && ./gradlew :app:assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+cd android && ./gradlew :app:assembleRelease
+adb install app/build/outputs/apk/release/loculus-0.1.0-release.apk
 adb shell am start -n de.schaefer.eosgps/.MainActivity
 ```
 
-**Toolchain (April 2026):** AGP 9.1.0, Kotlin 2.3.20, Gradle 9.4.1, Compose BOM 2026.03.00, compileSdk 36, minSdk 31.
+**Toolchain (April 2026):** AGP 9.2.0, Kotlin 2.3.21, Gradle 9.4.1, Compose BOM 2026.04.01, compileSdk 37, minSdk 34, Java 21.
 
 **Kotlin-Dateien:**
 
@@ -480,4 +480,4 @@ CameraConnect-decompiled/sources/
 
 ---
 
-*Letzte Aktualisierung: 2026-04-19 (Phase 12)*
+*Letzte Aktualisierung: 2026-04-25 (Phase 13)*

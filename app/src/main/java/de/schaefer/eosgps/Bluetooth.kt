@@ -45,12 +45,6 @@ fun resolveSelectedDevice(ctx: Context): BluetoothDevice? {
     return null
 }
 
-/**
- * Returns the enabled BLE scanner iff all preconditions for a scan are met:
- * runtime BT permissions, an adapter, the adapter is on, and a bonded EOS
- * camera exists. Returns `null` (not exceptions) on any failure — callers
- * simply no-op.
- */
 fun bluetoothAdapter(ctx: Context): BluetoothAdapter? {
     val mgr = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
     val adapter = mgr?.adapter ?: return null

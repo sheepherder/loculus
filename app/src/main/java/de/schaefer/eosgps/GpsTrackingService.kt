@@ -13,7 +13,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.location.Location
-import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -121,11 +120,7 @@ class GpsTrackingService : Service() {
         if (hasBackgroundLocation(this)) {
             types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
         }
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, notif, types)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
+        startForeground(NOTIF_ID, notif, types)
         TrackingState.serviceRunning.value = true
         TrackingState.resetSession()
 
@@ -193,6 +188,9 @@ class GpsTrackingService : Service() {
             onStateChange = {
                 TrackingState.connState.value = it
                 updateNotification()
+                if (it == ConnState.GPS_SESSION_ACTIVE) {
+                    mainHandler.postDelayed(rssiPollRunnable, RSSI_POLL_INTERVAL_MS)
+                }
                 if (it == ConnState.IDLE) onGattDisconnected()
             },
             onGpsState = {
@@ -212,7 +210,6 @@ class GpsTrackingService : Service() {
         )
         gatt = client
         client.connect(device)
-        mainHandler.postDelayed(rssiPollRunnable, RSSI_POLL_INTERVAL_MS)
     }
 
     private fun onGattDisconnected() {
@@ -257,7 +254,7 @@ class GpsTrackingService : Service() {
         fused.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
     }
 
-    private fun onLocation(loc: Location) {
+    internal fun onLocation(loc: Location) {
         val client = gatt ?: return
         if (client.gpsState != CanonGpsState.READY_TO_RECEIVE) return
 
@@ -328,7 +325,7 @@ class GpsTrackingService : Service() {
 
         fun start(ctx: Context) {
             val i = Intent(ctx, GpsTrackingService::class.java)
-            ContextCompat.startForegroundService(ctx, i)
+            ctx.startForegroundService(i)
         }
 
         fun stop(ctx: Context) {

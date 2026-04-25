@@ -880,4 +880,52 @@ Falls sich etwas als problematisch herausstellt:
 
 Ebenfalls entfernte UUID-Konstanten: `GPS_STATUS`, `HANDOVER_NOTIFY`, `REMOTE_STATUS`, `REMOTE_EVENTS`, `REMOTE_ZOOM`, `REMOTE_EXPOSURE`, `REMOTE_APERTURE`. Felder: `statusChar`, `handoverNotifyChar`.
 
-*Letzte Aktualisierung: 2026-04-19 (Phase 12)*
+## Phase 13 — Modernisierung & Strictness (25. April 2026)
+
+### Build-System
+
+- **Version Catalog** eingeführt (`gradle/libs.versions.toml`): alle Dependency-Versionen zentralisiert, `build.gradle.kts` nutzt `alias(libs.plugins.*)` und `libs.*` statt hardcoded Strings
+- **SDK-Update**: compileSdk/targetSdk 36 → 37, minSdk 33 → 34, Java 17 → 21
+- **Dependency-Updates**: AGP 9.1.0 → 9.2.0, Kotlin 2.3.20 → 2.3.21, Compose BOM 2026.03.00 → 2026.04.01, core-ktx → 1.18.0, activity-compose → 1.13.0, lifecycle-runtime-ktx → lifecycle-runtime-compose 2.10.0
+- **Gradle** configuration-cache + caching aktiviert
+
+### Striktere Compiler/Lint-Config
+
+Kotlin-Compiler: `allWarningsAsErrors`, `progressiveMode`, `-Wextra`, `-Xjsr305=strict`.
+
+Android Lint: `checkAllWarnings`, `checkReleaseBuilds`, `checkTestSources`, `checkGeneratedSources`, `warningsAsErrors`, `abortOnError`. Ergebnis: 51 Lint-Fehler gefunden und behoben.
+
+### R8 Log-Stripping
+
+`-assumenosideeffects` in `proguard-rules.pro` entfernt `Log.v/d/i/w` komplett aus dem Release-APK. Nur `Log.e` bleibt. `LogConditional`-Lint-Check disabled (redundant da R8 übernimmt).
+
+### SyntheticAccessor-Fixes
+
+35 `SyntheticAccessor`-Lint-Fehler: inner anonymous objects (GATT-Callback, ScanCallback, Runnable, LocationCallback) greifen auf `private` Members der äußeren Klasse zu → Kotlin erzeugt synthetische Accessor-Methoden. Fix: `private` → `internal` in CanonGattClient, FgScanner, GpsTrackingService. R8 optimiert die Accessors im Release ohnehin weg, der Lint-Check ist trotzdem sinnvoll als Bytecode-Hygiene.
+
+### API-36-Bug: BluetoothGattConnectionSettings
+
+`BluetoothGattConnectionSettings.Builder()` ist in den SDK-37-Stubs als public deklariert, aber auf dem Pixel 9a (API 36) auf der Hidden-API-Blocklist (`domain=platform, api=blocked`). Crash: `NoSuchMethodError`. Lint's `NewApi`-Check fängt das nicht, weil die Stubs die API als ab API 36 verfügbar annotieren — Inkonsistenz zwischen Compile-Stubs und Runtime.
+
+Fix: Fallback auf die traditionelle `connectGatt(context, autoConnect, callback, transport, phy, handler)` Überladung (seit API 26). Die ist deprecated zugunsten der kaputten neuen API, daher `@Suppress("DEPRECATION")`.
+
+### minSdk-34-Vereinfachungen
+
+- `Build.VERSION.SDK_INT >= 34` Check in GpsTrackingService entfernt (immer true)
+- `ContextCompat.startForegroundService` → `ctx.startForegroundService` (Compat-Wrapper war für API < 26)
+- Obsoleten Kommentar über FLAG_MUTABLE "required on API 31+" entfernt
+
+### Code-Review (6 Agenten parallel)
+
+Drei Claude-Agenten (Code Reuse, Quality, Efficiency) und drei Codex-Agenten parallel gestartet. Konsens-Findings:
+
+| Fix | Quelle |
+|-----|--------|
+| `shutterReady`-Duplikat → `gpsActive` wiederverwendet | Quality |
+| Misleading KDoc auf `bluetoothAdapter()` entfernt | Quality |
+| ON_RESUME-Setup-Duplikation in MainScreen → lokale `onResume()` | Quality |
+| RSSI-Poll startet erst bei `GPS_SESSION_ACTIVE` statt bei `connect()` | Efficiency |
+| `hasAllPerms()` nur 1× pro `currentScreen()`-Aufruf (enthält blocking `future.get()`) | Efficiency |
+| KeyValueRow Lambda `value` → `content` (Compose-Konvention) | Lint |
+
+*Letzte Aktualisierung: 2026-04-25 (Phase 13)*
