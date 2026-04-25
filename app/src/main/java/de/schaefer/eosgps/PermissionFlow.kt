@@ -214,7 +214,7 @@ private fun requestBatteryOptExemption(ctx: Context) {
 private fun hasUnusedAppRestrictions(ctx: Context): Boolean {
     return try {
         val future = PackageManagerCompat.getUnusedAppRestrictionsStatus(ctx)
-        val status = future.get(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        val status = future.get()
         status == UnusedAppRestrictionsConstants.API_30_BACKPORT
                 || status == UnusedAppRestrictionsConstants.API_30
                 || status == UnusedAppRestrictionsConstants.API_31
