@@ -35,14 +35,12 @@ fun findAllBondedCanon(ctx: Context): List<BluetoothDevice> {
 }
 
 @SuppressLint("MissingPermission")
-fun resolveSelectedDevice(ctx: Context): BluetoothDevice? {
-    findSelectedDevice(ctx)?.let { return it }
+fun resolveSelectedDevice(ctx: Context) {
+    if (findSelectedDevice(ctx) != null) return
     val all = findAllBondedCanon(ctx)
     if (all.size == 1) {
         Prefs.setSelectedDeviceMac(ctx, all[0].address)
-        return all[0]
     }
-    return null
 }
 
 fun bluetoothAdapter(ctx: Context): BluetoothAdapter? {

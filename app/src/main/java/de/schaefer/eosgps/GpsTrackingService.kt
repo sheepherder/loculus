@@ -140,35 +140,30 @@ class GpsTrackingService : Service() {
         startGattSession()
     }
 
-    private fun stopTracking() {
-        if (!TrackingState.serviceRunning.value) return
-        TrackingState.serviceRunning.value = false
-        Log.i(TAG, "stopTracking")
+    private fun releaseSession() {
+        if (!TrackingState.serviceRunning.value && gatt == null) return
         mainHandler.removeCallbacks(rssiPollRunnable)
         fused.removeLocationUpdates(locationCallback)
-        activeService = null
         gatt?.sendStopAndClose()
         gatt = null
-        bondedDevice = null
+        TrackingState.serviceRunning.value = false
         TrackingState.connState.value = ConnState.IDLE
         TrackingState.gpsState.value = CanonGpsState.UNKNOWN
+    }
+
+    private fun stopTracking() {
+        if (!TrackingState.serviceRunning.value) return
+        Log.i(TAG, "stopTracking")
+        releaseSession()
+        activeService = null
+        bondedDevice = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(rssiPollRunnable)
-        fused.removeLocationUpdates(locationCallback)
+        releaseSession()
         if (activeService === this) activeService = null
-        gatt?.sendStopAndClose()
-        gatt = null
-        TrackingState.serviceRunning.value = false
-        TrackingState.connState.value = ConnState.IDLE
-        TrackingState.gpsState.value = CanonGpsState.UNKNOWN
-
-        // Rearm (unregister+register) rather than trusting the OS scan
-        // engine's edge state: after a long GATT session it may still see
-        // the camera as "found" and never fire a fresh FIRST_MATCH.
         val ctx = applicationContext
         if (Prefs.trackingEnabled(ctx) && !TrackingState.appVisible) {
             CanonScanRegistrar.rearm(ctx)
@@ -226,8 +221,6 @@ class GpsTrackingService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun sendLastLocationIfFresh() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
-            != PackageManager.PERMISSION_GRANTED) return
         fused.lastLocation.addOnSuccessListener { loc ->
             if (loc == null || TrackingState.fixCount.value > 0) return@addOnSuccessListener
             val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000

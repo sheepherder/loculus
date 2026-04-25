@@ -85,8 +85,6 @@ internal sealed class GattOp {
         val data: ByteArray,
         val label: String,
     ) : GattOp()
-
-    data class Read(val ch: BluetoothGattCharacteristic, val label: String) : GattOp()
 }
 
 @SuppressLint("MissingPermission")
@@ -253,10 +251,6 @@ class CanonGattClient(
                     Log.i(TAG,"→ write descriptor ${op.label}")
                     writeDesc(g, op.desc, op.data)
                 }
-                is GattOp.Read -> {
-                    Log.i(TAG,"→ read ${op.label}")
-                    g.readCharacteristic(op.ch)
-                }
             }
             if (!ok) {
                 Log.i(TAG,"op dispatch returned false, advancing")
@@ -394,11 +388,6 @@ class CanonGattClient(
             state = ConnState.REQUESTING_GPS
             handler.removeCallbacks(stateTimeout)
             handler.postDelayed(stateTimeout, 10_000L)
-        }
-
-        override fun onCharacteristicRead(g: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
-            Log.i(TAG,"onCharacteristicRead ${shortUuid(ch.uuid)} status=$status val=${value.toHexCompact()}")
-            opCompleted()
         }
 
         override fun onCharacteristicWrite(g: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {

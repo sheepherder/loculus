@@ -79,9 +79,9 @@ object CanonScanRegistrar {
      * GATT session the engine may still see the camera as "found", never
      * emitting another FIRST_MATCH. Unregister + register clears that.
      */
-    fun rearm(ctx: Context): Boolean {
+    fun rearm(ctx: Context) {
         unregister(ctx)
-        return register(ctx)
+        register(ctx)
     }
 
     private fun buildPendingIntent(ctx: Context): PendingIntent {

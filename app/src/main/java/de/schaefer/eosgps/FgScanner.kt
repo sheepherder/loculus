@@ -110,7 +110,7 @@ object FgScanner {
     @SuppressLint("MissingPermission")
     internal fun stopScanInternal() {
         if (!running) return
-        try { scanner?.stopScan(callback) } catch (_: Exception) {}
+        try { scanner?.stopScan(callback) } catch (_: SecurityException) {}
         running = false
     }
 

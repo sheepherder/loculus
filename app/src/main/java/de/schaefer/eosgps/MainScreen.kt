@@ -50,6 +50,14 @@ import kotlinx.coroutines.delay
 
 private const val AD_STALENESS_MS = 8_000L
 
+private val SignalGood = Color(0xFF4CAF50)
+private val SignalWarn = Color(0xFFFFB74D)
+private val SignalError = Color(0xFFE57373)
+private val SignalIdle = Color(0xFF757575)
+private val SignalOff = Color(0xFF9E9E9E)
+private const val RSSI_GOOD = -60
+private const val RSSI_WEAK = -75
+
 @SuppressLint("MissingPermission")
 @Composable
 internal fun MainScreen(onChangeDevice: () -> Unit) {
@@ -218,7 +226,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
                 }
                 if (writeErrors > 0) {
                     KeyValueRow("Fehler") {
-                        MonoText("$writeErrors", color = Color(0xFFE57373))
+                        MonoText("$writeErrors", color = SignalError)
                     }
                 }
             }
@@ -279,7 +287,7 @@ internal fun MainScreen(onChangeDevice: () -> Unit) {
                     if (trackingEnabled) "Aktiv" else "Aus",
                     fontFamily = FontFamily.Monospace, fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = if (trackingEnabled) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (trackingEnabled) SignalGood else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Switch(
                     checked = trackingEnabled,
@@ -378,28 +386,28 @@ private fun rateText(fixCount: Int, sessionStart: Long?, nowTick: Long): String 
 }
 
 private fun connStateColor(s: ConnState): Color = when (s) {
-    ConnState.IDLE -> Color(0xFF757575)
-    ConnState.GPS_SESSION_ACTIVE -> Color(0xFF4CAF50)
-    ConnState.DISCONNECTING -> Color(0xFFE57373)
-    else -> Color(0xFFFFB74D)
+    ConnState.IDLE -> SignalIdle
+    ConnState.GPS_SESSION_ACTIVE -> SignalGood
+    ConnState.DISCONNECTING -> SignalError
+    else -> SignalWarn
 }
 
 private fun gpsStateColor(s: CanonGpsState): Color = when (s) {
-    CanonGpsState.READY_TO_RECEIVE -> Color(0xFF4CAF50)
-    CanonGpsState.UNKNOWN -> Color(0xFF757575)
-    else -> Color(0xFFFFB74D)
+    CanonGpsState.READY_TO_RECEIVE -> SignalGood
+    CanonGpsState.UNKNOWN -> SignalIdle
+    else -> SignalWarn
 }
 
 private fun powerStateColor(s: CameraPowerState): Color = when (s) {
-    CameraPowerState.POWER_ON -> Color(0xFF4CAF50)
-    CameraPowerState.AUTO_POWER_OFF -> Color(0xFFFFB74D)
-    CameraPowerState.POWER_SW_OFF -> Color(0xFF9E9E9E)
-    CameraPowerState.UNSEEN -> Color(0xFF757575)
+    CameraPowerState.POWER_ON -> SignalGood
+    CameraPowerState.AUTO_POWER_OFF -> SignalWarn
+    CameraPowerState.POWER_SW_OFF -> SignalOff
+    CameraPowerState.UNSEEN -> SignalIdle
 }
 
 private fun rssiColor(rssi: Int?): Color = when {
-    rssi == null -> Color(0xFF9E9E9E)
-    rssi >= -60 -> Color(0xFF4CAF50)
-    rssi >= -75 -> Color(0xFFFFB74D)
-    else -> Color(0xFFE57373)
+    rssi == null -> SignalOff
+    rssi >= RSSI_GOOD -> SignalGood
+    rssi >= RSSI_WEAK -> SignalWarn
+    else -> SignalError
 }
