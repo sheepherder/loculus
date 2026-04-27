@@ -65,7 +65,7 @@ The power state is encoded in **bits 1-2** of byte 5. Extract with: `(byte5 >> 1
 | `0b10` | 2 | `0x04` or `0x05` | POWER_SW_OFF | Main power switch off (deep standby) |
 | `0b11` | 3 | `0x06` or `0x07` | (unknown) | Not observed; treat as no state change |
 
-Bit 0 of byte 5 has no known semantics and is ignored. Bits 3-7 are unverified.
+Bit 0 of byte 5 is a separate flag named `flagA` in Canon's own code (`C0231d.java`). Its purpose is unknown — Canon's app reads it but does not act on it visibly. Observed values: `0` when POWER_ON (`0x02`), `1` when POWER_SW_OFF (`0x05`). We ignore it for power-state decoding. Bits 3-7 are unverified.
 
 **Only connect when bits 1-2 = `0b01` (POWER_ON).** Connecting to AUTO_POWER_OFF cameras would wake them unnecessarily. POWER_SW_OFF cameras accept connections but cannot stream GPS.
 
