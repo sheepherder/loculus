@@ -51,16 +51,44 @@ Canon EOS cameras advertise continuously in both active and standby mode. The po
 ```
 Byte 0..4   constant  01 0b 33 f3 4b   (protocol version / model family,
                                          unverified across models)
-Byte 5      variable  0x02 = AWAKE (camera fully powered on)
-                      0x05 = ASLEEP (camera in BLE standby)
-                      other → treat conservatively as ASLEEP
+Byte 5      power state encoded in bits 1-2
 ```
 
-Note: the camera's MAC address falls in Murata's OUI range (IEEE registry — Murata manufactures the BLE module), while the advertisement Company ID `0x01A9` belongs to Canon Inc. (Bluetooth SIG registry — Canon owns the protocol). Both registries address different layers; this is normal.
+### Power State Decoding (Byte 5)
 
-Additional signal (redundant but stable):
-- Awake: advertising rate ~200 ms (5–6 ads/s)
-- Asleep: advertising rate ~3 s
+The power state is encoded in **bits 1-2** of byte 5. Extract with: `(byte5 >> 1) & 0x03`
+
+| Bits 1-2 | Value | Raw byte 5 (example) | State | Meaning |
+|----------|-------|---------------------|-------|---------|
+| `0b00` | 0 | `0x00` or `0x01` | AUTO_POWER_OFF | Camera auto-idled; connecting would wake it |
+| `0b01` | 1 | `0x02` or `0x03` | **POWER_ON** | Camera fully powered — safe to connect |
+| `0b10` | 2 | `0x04` or `0x05` | POWER_SW_OFF | Main power switch off (deep standby) |
+| `0b11` | 3 | `0x06` or `0x07` | (unknown) | Not observed; treat as no state change |
+
+Bit 0 of byte 5 has no known semantics and is ignored. Bits 3-7 are unverified.
+
+**Only connect when bits 1-2 = `0b01` (POWER_ON).** Connecting to AUTO_POWER_OFF cameras would wake them unnecessarily. POWER_SW_OFF cameras accept connections but cannot stream GPS.
+
+### Hardware Scan Filter
+
+To filter for awake cameras at the BLE scan level (no app wakeup for sleeping cameras):
+
+```
+Manufacturer data:  [0x00, 0x00, 0x00, 0x00, 0x00, 0x02]   (byte 5 = 0x02)
+Mask:               [0x00, 0x00, 0x00, 0x00, 0x00, 0x06]   (check only bits 1-2)
+```
+
+The mask `0x06` ensures only bits 1-2 of byte 5 are matched, ignoring bytes 0-4 entirely (they appear constant on R6m2 but are unverified across models).
+
+### Additional Signals
+
+Advertising rate (redundant but stable):
+- POWER_ON: ~200 ms (5-6 ads/s)
+- AUTO_POWER_OFF / POWER_SW_OFF: ~3 s
+
+### Notes
+
+The camera's MAC address falls in Murata's OUI range (IEEE registry — Murata manufactures the BLE module), while the advertisement Company ID `0x01A9` belongs to Canon Inc. (Bluetooth SIG registry — Canon owns the protocol). Both registries address different layers; this is normal.
 
 Android API: `scanResult.scanRecord.getManufacturerSpecificData(0x01A9)` returns the 6 bytes *after* the Company ID.
 
@@ -76,7 +104,7 @@ Verified via HCI snoop of the official Canon Camera Connect app, reproduced mult
 
 2. **Write `0x0a` to `00020002`** (Handover Data, `WRITE_TYPE_DEFAULT`). Camera responds with a notification on the same characteristic (~20-byte payload, presumably a capability handshake).
 
-3. **Write `0x05 0x00 0x00 0x00 0x00 0x00 0x00 0x00` to `00040002`** (GPS Data, source query, 8 bytes). Camera responds via indication on `00040003` with `0x05 0xNN` where `0xNN` is the active source (`0x04` = smartphone).
+3. **Write `0x05 0x00 0x00 0x00 0x00 0x00 0x00 0x00` to `00040002`** (GPS Data, source query, 8 bytes). Camera responds via indication on `00040003` with `0x05 0xNN` where `0xNN` is the active GPS source (see source enum below).
 
 4. **Write `0x01` to `0001000a`** (Pairing Data, `WRITE_TYPE_DEFAULT`). This is the actual trigger for the ready indication. Side effect: the **Bluetooth icon** on the camera display turns blue.
 
@@ -96,6 +124,8 @@ Unnecessary steps:
 
 Not documented in any other public project (as of April 2026). Likely only required when an app inherits an existing Canon Camera Connect bond rather than performing a fresh pairing.
 
+The camera responds with a ~20-byte notification on the same characteristic (`00020002`). The response payload contains WiFi handover data, including the phone's MAC address as seen by the camera (bytes 8-13, reversed). The response content is not used by Loculus — only the write itself is needed to advance the kickoff sequence.
+
 ---
 
 ## GPS Commands on `00040002`
@@ -112,6 +142,35 @@ Not documented in any other public project (as of April 2026). Likely only requi
 **Write type rules:**
 - Command writes → `WRITE_TYPE_DEFAULT` (with response)
 - GPS fix (`0x04` + 19 bytes) → `WRITE_TYPE_NO_RESPONSE` (fire and forget)
+
+### GPS Source Enum
+
+The source query (`0x05`) and source set (`0x06`) commands use these values:
+
+| Value | Meaning |
+|-------|---------|
+| `0x00` | Disabled |
+| `0x01` | External GPS receiver |
+| `0x02` | Built-in GPS (cameras with GPS module) |
+| `0x03` | Built-in GPS off |
+| `0x04` | **Smartphone** (the mode we use) |
+
+### GPS Indication States on `00040003`
+
+Indications received on the GPS NOTIFY characteristic during and after the kickoff sequence:
+
+| Byte 0 | State | Meaning |
+|--------|-------|---------|
+| `0x01` | STATE_1 | Intermediate (observed during transitions) |
+| `0x02` | **READY_TO_RECEIVE** | Camera ready for GPS frames — start streaming |
+| `0x03` | STATE_3 | Intermediate (observed during stop/teardown) |
+| `0x05` | Source info | Byte 1 contains the active GPS source (see enum above) |
+
+Only `0x02` (READY_TO_RECEIVE) is the signal to begin sending GPS data.
+
+### GPS Status Characteristic (`00040001`)
+
+Read-only. Observed value: `03 13 00` (3 bytes). Bit 1 of byte 0 (`0x02`) indicates "GPS source was last set to smartphone" — but this value **persists across power cycles and standby**. It is not a ready signal. Only a fresh indication on `00040003` is authoritative.
 
 ---
 
@@ -209,10 +268,12 @@ For apps that reuse an existing bond (established via Canon Camera Connect), the
 
 1. **LITTLE-ENDIAN** in the GPS frame (decompilation suggested BE, wire format is LE)
 2. **INDICATION not NOTIFICATION** for `00040003` CCCD (value `0x0200`, not `0x0100`)
-3. **Source query is 8 bytes** (`[0x05, 0, 0, 0, 0, 0, 0, 0]`)
+3. **Source query is 8 bytes** (`[0x05, 0, 0, 0, 0, 0, 0, 0]`) — not just `0x05`
 4. **Pairing `0x01` write is mandatory** — without it, no ready indication and the BT icon stays gray
-5. **STATUS bit 1 is not a ready signal** — it persists across power cycles; only a fresh indication is authoritative
-6. **Advertisement power byte as wake trigger** — no connect, no wake; byte 5 decides
+5. **STATUS (`00040001`) is not a ready signal** — bit 1 persists across power cycles. Only a fresh indication on `00040003` is authoritative
+6. **Advertisement power byte as wake trigger** — no connect, no wake; only bits 1-2 of byte 5 decide
+7. **GPS frames require `WRITE_TYPE_NO_RESPONSE`** — using `WRITE_TYPE_DEFAULT` (expecting ACK) causes a hang; the camera never sends a response for `0x04` data writes
+8. **NMEA text crashes the camera** — the GPS characteristic expects 20-byte binary frames. Sending NMEA text after the `0x04` command byte corrupts the camera's GPS state machine, causing a busy-lock that requires a reboot
 
 ---
 
