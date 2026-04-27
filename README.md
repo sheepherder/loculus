@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="Loculus icon" width="80">
+</p>
+
 # Loculus
 
 Android app that streams GPS coordinates to Canon EOS cameras over Bluetooth LE, so your photos get EXIF geotags automatically — without keeping Canon's Camera Connect app running.
