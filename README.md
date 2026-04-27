@@ -5,11 +5,11 @@ Android app that streams GPS coordinates to Canon EOS cameras over Bluetooth LE,
 Turn your camera on, and Loculus handles the rest: it detects the camera's BLE advertisement, connects, and starts streaming your phone's location. When the camera goes to sleep or out of range, the connection tears down cleanly and Loculus waits for the next wake-up.
 
 <p align="center">
-  <img src="docs/welcome.png" alt="Welcome screen" width="270">
-  &nbsp;&nbsp;
-  <img src="docs/connected.png" alt="Active GPS session" width="270">
-  &nbsp;&nbsp;
-  <img src="docs/idle.png" alt="Camera off, waiting" width="270">
+  <img src="docs/welcome.png" alt="Welcome screen" width="230">
+  &nbsp;
+  <img src="docs/connected.png" alt="Active GPS session" width="230">
+  &nbsp;
+  <img src="docs/idle.png" alt="Camera off, waiting" width="230">
 </p>
 
 ## Supported Cameras
