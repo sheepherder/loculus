@@ -1,34 +1,33 @@
 # Loculus — Canon EOS GPS
 
-Android-App die per BLE GPS-Koordinaten an Canon-EOS-Kameras streamt.
+Android app that streams GPS coordinates to Canon EOS cameras over BLE.
 
 ## Build
 
 ```sh
-cd android
-./gradlew assembleRelease    # oder assembleDebug
+./gradlew assembleRelease    # or assembleDebug
 ```
 
-APK: `android/app/build/outputs/apk/release/loculus-0.1.0-release.apk`
+APK: `app/build/outputs/apk/release/loculus-0.1.0-release.apk`
 
-## Architektur
+## Architecture
 
-Single-Module Kotlin/Compose App. Kein DI, kein Repository-Pattern.
+Single-module Kotlin/Compose app. No DI, no repository pattern.
 
-- **CanonScanRegistrar** — OS-offloaded BLE-Scan (PendingIntent), weckt App bei Kamera-POWER_ON
-- **FgScanner** — Foreground-Scan (Activity-Lifecycle), zeigt Live-Status in UI
-- **GpsTrackingService** — FGS, ownt die GATT-Session und streamt GPS-Fixes
-- **CanonGattClient** — GATT State Machine mit Op-Queue
-- **CanonGpsFrame** — 20-Byte Binary GPS Frame Encoder (reverse-engineered)
-- **TrackingState** — Singleton mit MutableStateFlow, Bridge zwischen Service und UI
+- **CanonScanRegistrar** — OS-offloaded BLE scan (PendingIntent), wakes app on camera POWER_ON
+- **FgScanner** — Foreground scan (activity lifecycle), shows live status in UI
+- **GpsTrackingService** — FGS, owns the GATT session and streams GPS fixes
+- **CanonGattClient** — GATT state machine with op queue
+- **CanonGpsFrame** — 20-byte binary GPS frame encoder (reverse-engineered)
+- **TrackingState** — Singleton with MutableStateFlow, bridge between service and UI
 
 ## Lint & Compiler
 
 - `allWarningsAsErrors`, `progressiveMode`, `-Wextra`, `-Xjsr305=strict`
 - Lint: `checkAllWarnings`, `warningsAsErrors`, `abortOnError`
-- `LogConditional` disabled — R8 strippt Log.v/d/i/w via proguard-rules.pro
-- SyntheticAccessor-Fixes: betroffene Members sind `internal` statt `private`
+- `LogConditional` disabled — R8 strips Log.v/d/i/w via proguard-rules.pro
+- SyntheticAccessor fixes: affected members are `internal` instead of `private`
 
-## Gerät
+## Target Device
 
-Pixel 9a, Android 16, API 36. `BluetoothGattConnectionSettings` ist auf API 36 hidden (trotz compileSdk 37) — daher deprecated `connectGatt`-Overload mit `@Suppress("DEPRECATION")`.
+Pixel 9a, Android 16, API 36. `BluetoothGattConnectionSettings` is hidden on API 36 (despite compileSdk 37) — using deprecated `connectGatt` overload with `@Suppress("DEPRECATION")`.

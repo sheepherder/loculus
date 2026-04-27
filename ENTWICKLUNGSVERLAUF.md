@@ -1,6 +1,6 @@
 # Entwicklungsverlauf — Canon EOS GPS Reverse Engineering
 
-Dieses Dokument erzählt die Geschichte des Projekts chronologisch: was wurde probiert, was hat funktioniert, was nicht, und welche Erkenntnisse sind unterwegs entstanden. Für die rein technische Protokoll-Referenz siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md).
+Dieses Dokument erzählt die Geschichte des Projekts chronologisch: was wurde probiert, was hat funktioniert, was nicht, und welche Erkenntnisse sind unterwegs entstanden. Für die rein technische Protokoll-Referenz siehe [`PROTOCOL.md`](PROTOCOL.md).
 
 ## Motivation
 
@@ -12,7 +12,7 @@ Ziel dieses Projekts: eine Lösung bauen, bei der die Kamera **automatisch** GPS
 
 ### Ausgangslage
 
-- Kamera: Canon EOS R6 Mark II (`EOSR6m2_7BC192`, MAC `34:90:EA:7B:C1:93`)
+- Kamera: Canon EOS R6 Mark II
 - Ziel-Handy: Pixel 9a, war bereits mit der Kamera über die Canon-App gepairt
 - Entwicklungsrechner: Arch Linux mit CSR USB-Bluetooth-Adapter (`0a12:0001`)
 
@@ -27,14 +27,14 @@ Andere haben teile dieses Protokolls schon angefasst — allerdings nur für Rem
 
 ### Dekompilat der Canon Camera Connect App
 
-APKs von der Kamera-App wurden mit [**jadx**](https://github.com/skylot/jadx) dekompiliert und liegen unter `apk/CameraConnect-decompiled/`. Aus der Analyse ergaben sich:
+APKs von der Kamera-App wurden mit [**jadx**](https://github.com/skylot/jadx) dekompiliert und analysiert. Aus der Analyse ergaben sich:
 
 - Canon-UUID-Basis `d8492fffa821` — alle proprietären Services/Characteristics folgen dem Muster `0000XXXX-0000-1000-0000-d8492fffa821`
 - GATT Service `0004` = GPS Service
   - `00040001` Read/Notify = Status
   - `00040002` Write = Daten- und Kommando-Kanal
   - `00040003` Notify = Notifications
-- Kommando-Byte-Tabelle (siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md))
+- Kommando-Byte-Tabelle (siehe [`PROTOCOL.md`](PROTOCOL.md))
 - Format der GPS-Daten: Standard NMEA-0183 (`$GPGGA...`, `$GPRMC...`)
 
 Ein entscheidendes Detail — das **Prefix-Byte `0x04`** vor den NMEA-Bytes — wurde zu diesem Zeitpunkt übersehen. Es steckt in `com/canon/eos/T.java:183-188`, fiel aber erst später auf (siehe Phase 3).
@@ -58,7 +58,7 @@ Das umgeht das CSR-Problem komplett.
 
 ### Minimal-App
 
-Eine rudimentäre Kotlin/Compose-App unter `android/` — eine Activity, eine Liste der gebondeten Geräte, ein paar Buttons für `Connect` / `Enable GPS` / `Send Berlin`. Kein Foreground Service, keine echte Location, keine UI-Politur. Das Ziel war nur: **das Protokoll auf echter Hardware validieren**.
+Eine rudimentäre Kotlin/Compose-App — eine Activity, eine Liste der gebondeten Geräte, ein paar Buttons für `Connect` / `Enable GPS` / `Send Berlin`. Kein Foreground Service, keine echte Location, keine UI-Politur. Das Ziel war nur: **das Protokoll auf echter Hardware validieren**.
 
 Toolchain-Stand April 2026:
 - AGP 9.1.0 (März 2026)
@@ -351,7 +351,7 @@ App macht in Alltag-Szenarien das was sie soll:
 - `{2}`-Request-Path bei frisch zurückgesetzter Kamera — defensiv im Code drin, weiterhin ungetestet da unsere Bond-Beziehung nie vollständig reset wurde
 - DIS-Reads reaktivieren — bräuchte einen Weg die SMP-Keys nachzuinstallieren, nicht-trivial
 
-Siehe [`PROJEKT_DOKUMENTATION.md`](PROJEKT_DOKUMENTATION.md) für die aktualisierte technische Referenz.
+Siehe [`PROTOCOL.md`](PROTOCOL.md) für die aktualisierte technische Referenz.
 
 ## Phase 7 — Echter Auto-Start und Hintergrund-Leben (April 2026)
 
@@ -412,7 +412,7 @@ Fix: Hard-Cap von 2 Minuten auf den internen Scan. Danach automatisch Handoff: w
 Als die ersten Broadcasts reinkamen, zeigte unser Debug-Log ein verstörendes Bild:
 
 ```
-result addr=34:90:EA:7B:C1:93 rssi=0 mfg01A9=null b5=n/a
+result addr=XX:XX:XX:XX:XX:XX rssi=0 mfg01A9=null b5=n/a
 ```
 
 MAC stimmte. Aber `scanRecord` komplett leer — kein RSSI, kein Mfg-Data. Der anfängliche Receiver-Code hatte byte 5 nochmal als Defense-in-Depth gecheckt — das matchte natürlich nicht, die Broadcasts wurden verworfen.
@@ -519,7 +519,7 @@ Die App bleibt funktional identisch zu Phase 7: Boot-Auto-Start, Auto-Connect be
 
 ## Phase 9 — BLE-Feature-Exploration und Shutter-Auslöser (April 2026)
 
-Aus `IDEEN_FUER_SPAETER.md` war „BLE-Daten-Exploration + Feature-Ausbau" der nächste Punkt. Konkret stand die Frage im Raum welche der Canon-Characteristics im Smart-Pairing-Modus tatsächlich was tun, und ob sich ein Shutter-Write auf `00030030` (aus furble Issue #189 bekannt) in unsere GPS-Session einbauen lässt.
+„BLE-Daten-Exploration + Feature-Ausbau" war der nächste Punkt. Konkret stand die Frage im Raum welche der Canon-Characteristics im Smart-Pairing-Modus tatsächlich was tun, und ob sich ein Shutter-Write auf `00030030` (aus furble Issue #189 bekannt) in unsere GPS-Session einbauen lässt.
 
 ### Phase A — passive Exploration (und Abbruch)
 
@@ -653,7 +653,7 @@ Wäre ein dankbarer PR an `gkoh/furble` um dort die Canon-Scan-Robustheit mit de
 - **Wake-Detection gehört in die Advertisement-Payload, nicht in die Verbindung.** Die R6m2 broadcastet ihren Power-State (letztes Byte der Canon-Manufacturer-Data unter Company-ID `0x01A9`) bei jeder Advertising-Pulse. Passiv mit­lesen reicht, kein GATT, kein Wake. Canon macht das genauso — nicht verbinden, sondern scannen.
 - **Connection-Timing ist kein Signal.** BLE-Advertising-Zyklen bringen so viel Varianz rein dass „schneller Connect = wach" keine robuste Aussage ist. Korrelation mit Power-State-Byte war 1:1, Timing war es nie.
 - **Wireshark-Ausgabe ist nicht „die Bytes".** Manufacturer-Specific-Records werden halb-dekodiert dargestellt — ich habe zuerst `01 0b` als Company-ID LE gelesen (hab's sogar als „Canon Inc." zuordnen wollen und landete fälschlich bei `0x0B01`), obwohl die echte Company-ID `0x01A9` vorher abgetrennt wurde und die 6 Bytes die Wireshark als „Data" zeigt bereits der Rest **nach** der Company-ID sind. Im Android-API kommt's genauso an (`getManufacturerSpecificData(companyId)` gibt die Rest-Bytes zurück). Dreimal die Bytes mit Wireshark-Packet-Tree statt mit der Flat-Ausgabe verifizieren.
-- **MAC-OID und BLE-Company-ID sind zwei verschiedene Registries.** Canons R6m2 hat eine MAC `34:90:EA:...` deren OID laut IEEE an **Murata Manufacturing** vergeben ist (der Hersteller des BLE-Moduls), während die Advertisement-Company-ID `0x01A9` laut Bluetooth SIG an **Canon Inc.** vergeben ist. Es ist kein Widerspruch — die Hardware kommt von Murata, das Protokoll ist Canons. Scanner-Tools zeigen beides gleichzeitig an; leicht verwechselbar.
+- **MAC-OID und BLE-Company-ID sind zwei verschiedene Registries.** Canons R6m2 hat eine MAC deren OID laut IEEE an **Murata Manufacturing** vergeben ist (der Hersteller des BLE-Moduls), während die Advertisement-Company-ID `0x01A9` laut Bluetooth SIG an **Canon Inc.** vergeben ist. Es ist kein Widerspruch — die Hardware kommt von Murata, das Protokoll ist Canons. Scanner-Tools zeigen beides gleichzeitig an; leicht verwechselbar.
 - **Recherche vor Implementation.** `gkoh/furble` Issue #189 hatte das 20-Byte-Frame-Format, die INDICATE-CCCDs und den `01`-Pairing-Write-Trigger schon sechs Monate vor Projektstart entschlüsselt. Ein GitHub-Issue-Search oder grep nach Canon+GPS+BLE am Anfang hätte Phase 5 halbiert. Gelernt: **vor dem Dekompilieren die öffentlichen Issue-Threads und PRs durchsuchen**.
 - **Prüfe ob dein BLE-Sniff wirklich von dem Gerät ist, das du glaubst.** Ich habe eine Withings-ScanWatch-Konversation als Canon-Standby-Service fehlgedeutet. Zu schnell auf UUID-ähnelndes Pattern gesprungen, nicht auf MAC-Filter bestanden. Beim nächsten Mal: Filter auf Peer-MAC **vor** der Analyse, nicht nach.
 - **Initial-Read-Werte sind nicht „jetzt", sondern „zuletzt".** `ByteBuffer`-Werte der GATT-Characteristics sind die letzten Werte die die Kamera gesendet hat — oft aus einer früheren Session. Für Live-State musst du auf `onCharacteristicChanged` warten (Notification/Indication), nicht auf `onCharacteristicRead`. Ausnahme: wenn die Kamera ihren State seit dem letzten Mal nicht gewechselt hat, sendet sie keine frische Indication → dann ist der Read-Wert das Beste was du hast. Bedeutet: wir brauchen **beide** Pfade, mit Vorrang auf die Indication.
