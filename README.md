@@ -4,6 +4,14 @@ Android app that streams GPS coordinates to Canon EOS cameras over Bluetooth LE,
 
 Turn your camera on, and Loculus handles the rest: it detects the camera's BLE advertisement, connects, and starts streaming your phone's location. When the camera goes to sleep or out of range, the connection tears down cleanly and Loculus waits for the next wake-up.
 
+<p align="center">
+  <img src="docs/welcome.png" alt="Welcome screen" width="270">
+  &nbsp;&nbsp;
+  <img src="docs/connected.png" alt="Active GPS session" width="270">
+  &nbsp;&nbsp;
+  <img src="docs/idle.png" alt="Camera off, waiting" width="270">
+</p>
+
 ## Supported Cameras
 
 Tested and verified on the **Canon EOS R6 Mark II**. Should work with other Canon EOS models that support BLE GPS via Canon Camera Connect — the protocol appears to be shared across the EOS R lineup. If you test it on another model, please open an issue.
@@ -21,6 +29,8 @@ Tested and verified on the **Canon EOS R6 Mark II**. Should work with other Cano
 
 APK: `app/build/outputs/apk/release/loculus-0.1.0-release.apk`
 
+Toolchain: AGP 9.2, Kotlin 2.3, Compose, compileSdk 37, minSdk 34, Java 21. Strict compiler and lint settings (`allWarningsAsErrors`, `warningsAsErrors`). R8 strips `Log.v/d/i/w` from release builds via proguard rules.
+
 ## How It Works
 
 Loculus uses a scan-first architecture with zero battery waste:
@@ -30,7 +40,7 @@ Loculus uses a scan-first architecture with zero battery waste:
 3. **GATT session** — connects, performs a minimal handshake (~550 ms), and starts streaming 20-byte binary GPS frames at 10-second intervals.
 4. **Graceful teardown** — sends a GPS-stop command and disconnects cleanly when the camera goes to sleep or out of range.
 
-The BLE protocol was reverse-engineered from HCI snoop logs. See [PROTOCOL.md](PROTOCOL.md) for the full technical reference, and [ENTWICKLUNGSVERLAUF.md](ENTWICKLUNGSVERLAUF.md) for the story of how we got there.
+The BLE protocol was reverse-engineered from HCI snoop logs. See [docs/protocol.md](docs/protocol.md) for the full technical reference, and [docs/entwicklungsverlauf.md](docs/entwicklungsverlauf.md) for the story of how we got there.
 
 ## Architecture
 
@@ -46,6 +56,8 @@ Single-module Kotlin/Compose app. No DI, no repository pattern.
 | `TrackingState` | Singleton StateFlow bridge between service and UI |
 
 ## Acknowledgments
+
+This app was largely developed with [Claude Code](https://claude.ai/code) (Anthropic's AI coding agent). The reverse engineering, protocol analysis, and implementation were done collaboratively — Claude wrote most of the code, with human guidance on architecture decisions, on-device testing, and HCI snoop analysis.
 
 - [gkoh/furble](https://github.com/gkoh/furble) — ESP32 Canon remote with GPS support. [Issue #189](https://github.com/gkoh/furble/issues/189) documents the GPS frame format and kickoff sequence (tested on R6).
 - [Ian Douglas Scott](https://iandouglasscott.com/2018/07/04/canon-dslr-bluetooth-remote-protocol/) — first public analysis of the Canon BLE pairing and shutter protocol (2018).

@@ -1,6 +1,6 @@
 # Entwicklungsverlauf — Canon EOS GPS Reverse Engineering
 
-Dieses Dokument erzählt die Geschichte des Projekts chronologisch: was wurde probiert, was hat funktioniert, was nicht, und welche Erkenntnisse sind unterwegs entstanden. Für die rein technische Protokoll-Referenz siehe [`PROTOCOL.md`](PROTOCOL.md).
+Dieses Dokument erzählt die Geschichte des Projekts chronologisch: was wurde probiert, was hat funktioniert, was nicht, und welche Erkenntnisse sind unterwegs entstanden. Für die rein technische Protokoll-Referenz siehe [`protocol.md`](protocol.md).
 
 ## Motivation
 
@@ -34,7 +34,7 @@ APKs von der Kamera-App wurden mit [**jadx**](https://github.com/skylot/jadx) de
   - `00040001` Read/Notify = Status
   - `00040002` Write = Daten- und Kommando-Kanal
   - `00040003` Notify = Notifications
-- Kommando-Byte-Tabelle (siehe [`PROTOCOL.md`](PROTOCOL.md))
+- Kommando-Byte-Tabelle (siehe [`protocol.md`](protocol.md))
 - Format der GPS-Daten: Standard NMEA-0183 (`$GPGGA...`, `$GPRMC...`)
 
 Ein entscheidendes Detail — das **Prefix-Byte `0x04`** vor den NMEA-Bytes — wurde zu diesem Zeitpunkt übersehen. Es steckt in `com/canon/eos/T.java:183-188`, fiel aber erst später auf (siehe Phase 3).
@@ -351,7 +351,7 @@ App macht in Alltag-Szenarien das was sie soll:
 - `{2}`-Request-Path bei frisch zurückgesetzter Kamera — defensiv im Code drin, weiterhin ungetestet da unsere Bond-Beziehung nie vollständig reset wurde
 - DIS-Reads reaktivieren — bräuchte einen Weg die SMP-Keys nachzuinstallieren, nicht-trivial
 
-Siehe [`PROTOCOL.md`](PROTOCOL.md) für die aktualisierte technische Referenz.
+Siehe [`protocol.md`](protocol.md) für die aktualisierte technische Referenz.
 
 ## Phase 7 — Echter Auto-Start und Hintergrund-Leben (April 2026)
 
