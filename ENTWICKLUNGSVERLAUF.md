@@ -308,7 +308,7 @@ Mit dieser Erkenntnis zurück zum HCI-Log: die Kamera advertiset, wir müssen nu
 
 **Das letzte Byte** encodiert den Power-State: `0x02` = wach, `0x05` = schlafend. Die ersten fünf Bytes (`01 0b 33 f3 4b`) sind konstant, vermutlich Modell/Revision. User hat mit einem separaten BLE-Scanner-Tool verifiziert dass awake-Ads alle ~200ms kommen, asleep-Ads alle ~3s — zweite unabhängige Signatur.
 
-Manufacturer-ID ist `0x01A9` = **Murata Manufacturing** (nicht Canon Inc. = `0x0B01`, was ich erst vermutet hatte — Canon nutzt halt Murata-Module). Byte-Index ist **5** (letztes von 6 Custom-Bytes nach der Company-ID — ich hatte erst irrtümlich 3 gerechnet weil ich die Wireshark-Ausgabe falsch geparst hatte: das erste Test-Screen zeigte die UI dauerhaft auf `asleep`, weil wir Byte 3 (`0xf3`, konstant) gelesen haben, der nicht matchte → Fallback auf ASLEEP).
+Manufacturer-ID ist `0x01A9` — hier lag ich falsch: ich hielt es für **Murata Manufacturing**, tatsächlich ist `0x01A9` laut Bluetooth-SIG **Canon Inc.** (die MAC-OUI `34:90:EA` ist Murata, aber das ist eine andere Registry — siehe Lessons Learned). Byte-Index ist **5** (letztes von 6 Custom-Bytes nach der Company-ID — ich hatte erst irrtümlich 3 gerechnet weil ich die Wireshark-Ausgabe falsch geparst hatte: das erste Test-Screen zeigte die UI dauerhaft auf `asleep`, weil wir Byte 3 (`0xf3`, konstant) gelesen haben, der nicht matchte → Fallback auf ASLEEP).
 
 ### Scan-First-Architektur
 
@@ -372,7 +372,7 @@ Der HW-Filter nutzt `setManufacturerData(0x01A9, data, mask)`. Erste Version war
 - Byte 0–4 kannten wir nur empirisch auf genau einer R6m2 (`01 0b 33 f3 4b`) — unverifiziert ob das zwischen Firmware-Versionen oder Exemplaren konstant ist.
 - In Byte 5 kannten wir nur zwei Werte: `0x02` (awake) und `0x05` (asleep). Die unterscheiden sich nur in den unteren 3 Bits (`010` vs `101`); was die oberen 5 Bits je machen könnten, wissen wir nicht.
 
-Finale Filter-Maske: `data=[0,0,0,0,0,0x02]`, `mask=[0,0,0,0,0,0x07]`. Also ignoriere Bytes 0–4 komplett, und in Byte 5 matche nur die unteren 3 Bits. Das folgt direkt der Phase-6-Lesson: **nicht auf unverifizierte Felder bauen**. Wenn Canon irgendwann ein Flag-Bit dort oben setzt — kein Problem, wir matchen weiter.
+Finale Filter-Maske: `data=[0,0,0,0,0,0x02]`, `mask=[0,0,0,0,0,0x07]`. Also ignoriere Bytes 0–4 komplett, und in Byte 5 matche nur die unteren 3 Bits. Das folgt direkt der Phase-6-Lesson: **nicht auf unverifizierte Felder bauen**. (Später nochmals korrigiert auf `mask=0x06` — nur Bits 1-2 — als Bit 0 als separates Flag `flagA` in Canons Code identifiziert wurde.)
 
 MAC-Filter zunächst bewusst NICHT im HW-Filter: `setDeviceAddress(String, int)` mit explizitem Address-Type ist `@SystemApi`, die 1-Argument-Variante war in Phase 6 als pickig kommentiert worden. Die Annahme hat sich im Nachtest aber nicht bestätigen lassen: Canons MAC ist public (Murata-OUI im IEEE-Register), Android 12+ löst das mit dem 1-arg-`setDeviceAddress(mac)` sauber auf. Nach der Verifikation ist die MAC jetzt in beiden Scan-Pfaden Teil des HW-Filters — keine Weck-Broadcasts mehr für fremde Canon-Kameras, und der MAC-Check im Receiver-Code entfiel ersatzlos. Lesson: Annahmen aus vorigen Phasen nicht als Fakten übernehmen ohne Nachtest.
 
