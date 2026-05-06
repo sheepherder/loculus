@@ -120,6 +120,10 @@ class CanonGattClient(
                 Log.w(TAG, "REQUESTING_GPS timeout (10s) — disconnecting")
                 doDisconnect()
             }
+            ConnState.DISCONNECTING -> {
+                Log.w(TAG, "DISCONNECTING timeout — forcing IDLE")
+                resetToIdle(gatt)
+            }
             else -> {}
         }
     }
@@ -224,7 +228,21 @@ class CanonGattClient(
     internal fun doDisconnect() {
         val g = gatt ?: run { state = ConnState.IDLE; return }
         state = ConnState.DISCONNECTING
+        handler.removeCallbacks(stateTimeout)
+        handler.postDelayed(stateTimeout, 5_000L)
         g.disconnect()
+    }
+
+    private fun resetToIdle(g: BluetoothGatt?) {
+        handler.removeCallbacks(stateTimeout)
+        clearQueue()
+        g?.close()
+        if (gatt === g || g == null) gatt = null
+        dataChar = null; notifyChar = null
+        pairingDataChar = null; handoverDataChar = null
+        shutterChar = null
+        gpsState = CanonGpsState.UNKNOWN
+        state = ConnState.IDLE
     }
 
     // --- Op queue ---
@@ -290,16 +308,9 @@ class CanonGattClient(
                 state = ConnState.DISCOVERING
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                handler.removeCallbacks(stateTimeout)
                 lastDisconnectStatus = status
-                clearQueue()
-                g.close()
-                if (gatt === g) gatt = null
-                dataChar = null; notifyChar = null
-                pairingDataChar = null; handoverDataChar = null
-                shutterChar = null
-                gpsState = CanonGpsState.UNKNOWN
-                state = ConnState.IDLE
+                if (state == ConnState.IDLE) { g.close(); return }
+                resetToIdle(g)
             }
         }
 

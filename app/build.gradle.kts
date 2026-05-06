@@ -3,7 +3,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-val appVersion = "0.1.0"
+val appVersion = "0.1.1"
 
 base {
     archivesName = "loculus-$appVersion"

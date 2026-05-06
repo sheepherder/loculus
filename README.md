@@ -31,7 +31,7 @@ Tested and verified on the **Canon EOS R6 Mark II**. Should work with other Cano
 ./gradlew assembleRelease
 ```
 
-APK: `app/build/outputs/apk/release/loculus-0.1.0-release.apk`
+APK: `app/build/outputs/apk/release/loculus-0.1.1-release.apk`
 
 Toolchain: AGP 9.2, Kotlin 2.3, Compose, compileSdk 37, minSdk 34, Java 21. Strict compiler and lint settings (`allWarningsAsErrors`, `warningsAsErrors`). R8 strips `Log.v/d/i/w` from release builds via proguard rules.
 
