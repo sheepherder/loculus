@@ -35,6 +35,10 @@ APK: `app/build/outputs/apk/release/loculus-0.1.1-release.apk`
 
 Toolchain: AGP 9.2, Kotlin 2.3, Compose, compileSdk 37, minSdk 34, Java 21. Strict compiler and lint settings (`allWarningsAsErrors`, `warningsAsErrors`). R8 strips `Log.v/d/i/w` from release builds via proguard rules.
 
+## Troubleshooting
+
+**Keine Verbindung nach einem Kamera-Firmware-Update:** After a camera firmware update, the Bluetooth connection may fail — this also affects Canon's own Camera Connect app. Fix: reset the camera's communication settings, forget the camera in Android Bluetooth settings, and re-pair.
+
 ## How It Works
 
 Loculus uses a scan-first architecture with zero battery waste:
